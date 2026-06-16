@@ -1,0 +1,7 @@
+# Editor / OS cruft
+*.swp
+*~
+.DS_Store
+
+# Never commit user config (may contain Spotify credentials)
+play.conf

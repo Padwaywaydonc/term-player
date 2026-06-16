@@ -1,0 +1,680 @@
+#!/usr/bin/env bash
+# play [--size N] [--pos top|bottom|left|right] [--audio wsl|native] [--provider youtube|spotify|soundcloud] <search>
+# ← →:seek  ↑ ↓:vol  Space:pause  n:next  p:prev  l:list  s:settings  q:quit
+
+COUNT=10
+# Binary/temp paths are auto-detected below (after config load) and may be
+# overridden via env vars PLAY_MPV_LINUX, PLAY_MPV_WIN, PLAY_WIN_TEMP.
+
+# ── Defaults ──────────────────────────────────────────────────────────────────
+PLAY_SIZE=20
+PLAY_POS=top
+PLAY_PROVIDER=youtube
+SPOTIFY_CLIENT_ID=""
+SPOTIFY_CLIENT_SECRET=""
+grep -qi microsoft /proc/version 2>/dev/null && PLAY_AUDIO=wsl || PLAY_AUDIO=native
+CONFIG="$HOME/.config/play.conf"
+[ -f "$CONFIG" ] && . "$CONFIG"
+
+# Validate config (it's external input — a bad value must never brick the launcher)
+[[ "$PLAY_SIZE" =~ ^[0-9]+$ ]] || PLAY_SIZE=20
+case "$PLAY_POS" in top|bottom|left|right) ;; *) PLAY_POS=top ;; esac
+case "$PLAY_AUDIO" in wsl|native) ;; *) grep -qi microsoft /proc/version 2>/dev/null && PLAY_AUDIO=wsl || PLAY_AUDIO=native ;; esac
+case "$PLAY_PROVIDER" in youtube|spotify|soundcloud) ;; *) PLAY_PROVIDER=youtube ;; esac
+
+# ── Platform / binary detection ───────────────────────────────────────────────
+grep -qi microsoft /proc/version 2>/dev/null && IS_WSL=1 || IS_WSL=0
+
+# Linux mpv: prefer real system binaries over any ~/.local/bin wrapper.
+detect_linux_mpv() {
+    local c
+    for c in /usr/bin/mpv /usr/local/bin/mpv /home/linuxbrew/.linuxbrew/bin/mpv /opt/homebrew/bin/mpv; do
+        [ -x "$c" ] && { printf '%s' "$c"; return; }
+    done
+    command -v mpv 2>/dev/null
+}
+
+# Windows mpv (WSL only): PATH, common installers, then scoop per-user.
+detect_win_mpv() {
+    command -v mpv.exe >/dev/null 2>&1 && { command -v mpv.exe; return; }
+    local c
+    for c in \
+        "/mnt/c/Program Files/mpv/mpv.exe" \
+        "/mnt/c/Program Files/MPV Player/mpv.exe" \
+        "/mnt/c/Program Files/mpv.net/mpvnet.exe" \
+        "/mnt/c/Program Files (x86)/mpv/mpv.exe"; do
+        [ -x "$c" ] && { printf '%s' "$c"; return; }
+    done
+    local d
+    for d in /mnt/c/Users/*/scoop/apps/mpv/current/mpv.exe; do
+        [ -x "$d" ] && { printf '%s' "$d"; return; }
+    done
+}
+
+# Windows %TEMP% as a path mpv.exe (a Windows process) can open.
+detect_win_temp() {
+    local t; t=$(cmd.exe /c "echo %TEMP%" 2>/dev/null | tr -d '\r\n')
+    [[ "$t" == *:\\* ]] && printf '%s' "$t"
+}
+
+LINUX_MPV="${PLAY_MPV_LINUX:-$(detect_linux_mpv)}"
+MPV_WIN="${PLAY_MPV_WIN:-}"
+[ "$IS_WSL" = 1 ] && [ -z "$MPV_WIN" ] && MPV_WIN="$(detect_win_mpv)"
+
+if [ "$PLAY_AUDIO" = "wsl" ]; then
+    WIN_TEMP="${PLAY_WIN_TEMP:-$(detect_win_temp)}"
+    [ -n "$WIN_TEMP" ] && WSL_TEMP=$(wslpath "$WIN_TEMP" 2>/dev/null)
+    [ -z "${WSL_TEMP:-}" ] && { WSL_TEMP=/tmp; WIN_TEMP=$(wslpath -w /tmp 2>/dev/null); }
+fi
+
+# ── Dependency check ──────────────────────────────────────────────────────────
+check_deps() {
+    local missing=()
+    command -v yt-dlp >/dev/null 2>&1 || missing+=("yt-dlp  (pip install yt-dlp)")
+    if [ "$PLAY_AUDIO" = "wsl" ]; then
+        [ -n "$MPV_WIN" ] || missing+=("Windows mpv.exe  (install from mpv.io, or: scoop install mpv)")
+    else
+        [ -n "$LINUX_MPV" ] || missing+=("mpv  (e.g. apt install mpv / brew install mpv)")
+        command -v python3 >/dev/null 2>&1 || missing+=("python3  (mpv IPC bridge for native audio)")
+    fi
+    [ "$PLAY_PROVIDER" = "spotify" ] && ! command -v python3 >/dev/null 2>&1 \
+        && missing+=("python3  (Spotify search)")
+    if [ ${#missing[@]} -gt 0 ]; then
+        printf 'play: missing dependencies:\n' >&2
+        printf '  - %s\n' "${missing[@]}" >&2
+        printf '\nInstall the above and re-run.\n' >&2
+        exit 1
+    fi
+}
+check_deps
+
+# ── Config save (defined early so the tmux block can call it) ─────────────────
+save_config() {
+    mkdir -p "$(dirname "$CONFIG")"
+    {
+        printf 'PLAY_SIZE=%s\n'     "$PLAY_SIZE"
+        printf 'PLAY_POS=%s\n'      "$PLAY_POS"
+        printf 'PLAY_AUDIO=%s\n'    "$PLAY_AUDIO"
+        printf '%s=%s\n' PLAY_PROVIDER "$PLAY_PROVIDER"
+        [ -n "${SPOTIFY_CLIENT_ID:-}" ]     && printf '%s=%s\n' SPOTIFY_CLIENT_ID     "$SPOTIFY_CLIENT_ID"
+        [ -n "${SPOTIFY_CLIENT_SECRET:-}" ] && printf '%s=%s\n' SPOTIFY_CLIENT_SECRET "$SPOTIFY_CLIENT_SECRET"
+    } > "$CONFIG"
+}
+
+# ── Parse flags ───────────────────────────────────────────────────────────────
+while [[ "${1:-}" == --* ]]; do
+    case "$1" in
+        --size)     PLAY_SIZE="$2";     shift 2 ;;
+        --pos)      PLAY_POS="$2";      shift 2 ;;
+        --audio)    PLAY_AUDIO="$2";    shift 2 ;;
+        --provider) PLAY_PROVIDER="$2"; shift 2 ;;
+        *) printf "Usage: play [--size N] [--pos top|bottom|left|right] [--audio wsl|native] [--provider youtube|spotify|soundcloud] <query>\n" >&2; exit 1 ;;
+    esac
+done
+
+# ── Auto tmux split (outer instance only) ────────────────────────────────────
+if command -v tmux &>/dev/null && [ -z "$_PLAY_TMUX" ]; then
+    save_config
+    SELF=$(printf '%q' "$0")
+    Q=$(printf '%q ' "$@")
+    CMD="env _PLAY_TMUX=1 $SELF --size $PLAY_SIZE --pos $PLAY_POS --audio $PLAY_AUDIO --provider $PLAY_PROVIDER $Q"
+    TERM_SIZE=$(( 100 - PLAY_SIZE ))
+    case "$PLAY_POS" in
+        top|bottom) SFLAG="-v" ;;
+        left|right) SFLAG="-h" ;;
+        *)          SFLAG="-v" ;;
+    esac
+
+    if [ -n "$TMUX" ]; then
+        ORIG=$TMUX_PANE
+        case "$PLAY_POS" in
+            top|left)    tmux split-window $SFLAG -l "${PLAY_SIZE}%" -b "$CMD" ;;
+            bottom|right) tmux split-window $SFLAG -l "${PLAY_SIZE}%" "$CMD" ;;
+        esac
+        tmux select-pane -t "$ORIG"
+        exit 0
+    else
+        ROWS=$(tput lines 2>/dev/null || echo 24)
+        COLS=$(tput cols  2>/dev/null || echo 80)
+        tmux kill-session -t music 2>/dev/null
+        case "$PLAY_POS" in
+            top|left)
+                tmux new-session -d -s music -x "$COLS" -y "$ROWS" "$CMD"
+                tmux split-window $SFLAG -t music:0.0 -l "${TERM_SIZE}%"
+                tmux select-pane -t music:0.1 ;;
+            bottom|right)
+                tmux new-session -d -s music -x "$COLS" -y "$ROWS"
+                tmux split-window $SFLAG -t music:0.0 -l "${PLAY_SIZE}%" "$CMD"
+                tmux select-pane -t music:0.0 ;;
+        esac
+        exec tmux attach-session -t music
+    fi
+fi
+
+trap '' PIPE
+
+# ── Search with disk cache ────────────────────────────────────────────────────
+QUERY="${*:-ambient sci-fi}"
+CACHE_DIR="$HOME/.cache/play"
+mkdir -p "$CACHE_DIR"
+declare -a SEARCH_IDS SEARCH_TITLES SEARCH_DURS
+
+do_search() {
+    local q="$1"
+    local key; key=$(printf '%s:%s' "$PLAY_PROVIDER" "$q" | md5sum | cut -c1-8)
+    local cache_file="$CACHE_DIR/${key}.txt"
+    SEARCH_IDS=(); SEARCH_TITLES=(); SEARCH_DURS=()
+    unset STREAM_CACHE; declare -gA STREAM_CACHE
+    unset TITLE_CACHE;  declare -gA TITLE_CACHE
+    unset DUR_CACHE;    declare -gA DUR_CACHE
+    [ -n "${PREFETCH_PID:-}" ] && kill "$PREFETCH_PID" 2>/dev/null
+    PREFETCH_PID=""; PREFETCH_IDX=-1; rm -f "${PREFETCH_FILE:-}"
+
+    if [ ! -s "$cache_file" ]; then
+        if [ "$PLAY_PROVIDER" = "spotify" ]; then
+            if [ -z "$SPOTIFY_CLIENT_ID" ] || [ -z "$SPOTIFY_CLIENT_SECRET" ]; then
+                printf "  Spotify: add SPOTIFY_CLIENT_ID + SPOTIFY_CLIENT_SECRET to %s\n" "$CONFIG" >&2
+                printf "  Get free credentials at: developer.spotify.com/dashboard\n" >&2
+                return 1
+            fi
+            printf "\033[1m  Searching Spotify:\033[0m %s\n" "$q"
+            export SPOTIFY_CLIENT_ID SPOTIFY_CLIENT_SECRET
+            python3 - "$q" > "$cache_file" <<'PYEOF'
+import sys, json, os, urllib.request, urllib.parse
+cid  = os.environ['SPOTIFY_CLIENT_ID']
+csec = os.environ['SPOTIFY_CLIENT_SECRET']
+q    = sys.argv[1]
+data = urllib.parse.urlencode({'grant_type':'client_credentials','client_id':cid,'client_secret':csec}).encode()
+req  = urllib.request.Request('https://accounts.spotify.com/api/token', data=data,
+         headers={'Content-Type':'application/x-www-form-urlencoded'})
+try:
+    token = json.loads(urllib.request.urlopen(req).read())['access_token']
+except Exception as e:
+    sys.stderr.write(f"Spotify auth failed: {e}\n"); sys.exit(1)
+url = 'https://api.spotify.com/v1/search?' + urllib.parse.urlencode({'q': q, 'type': 'track', 'limit': 10})
+req = urllib.request.Request(url, headers={'Authorization': f'Bearer {token}'})
+for t in json.loads(urllib.request.urlopen(req).read())['tracks']['items']:
+    name    = t['name']
+    artist  = t['artists'][0]['name']
+    all_art = ', '.join(a['name'] for a in t['artists'])
+    dur     = f"{t['duration_ms']//60000}:{(t['duration_ms']%60000)//1000:02d}"
+    print(f"{name} {artist}|{name} - {all_art}|{dur}")
+PYEOF
+        elif [ "$PLAY_PROVIDER" = "soundcloud" ]; then
+            printf "\033[1m  Searching SoundCloud:\033[0m %s\n" "$q"
+            yt-dlp --flat-playlist --print "%(webpage_url)s|%(title)s|%(duration_string)s" \
+                "scsearch${COUNT}:${q}" 2>/dev/null > "$cache_file"
+        else
+            printf "\033[1m  Searching:\033[0m %s\n" "$q"
+            yt-dlp --print "%(id)s|%(title)s|%(duration_string)s" \
+                "ytsearch${COUNT}:${q}" 2>/dev/null > "$cache_file"
+        fi
+        [ -s "$cache_file" ] || { rm -f "$cache_file"; return 1; }
+    fi
+    while IFS='|' read -r id title dur; do
+        [ -n "$id" ] || continue
+        SEARCH_IDS+=("$id"); SEARCH_TITLES+=("$title"); SEARCH_DURS+=("$dur")
+    done < "$cache_file"
+}
+
+do_search "$QUERY"
+[ ${#SEARCH_IDS[@]} -eq 0 ] && { echo "No results found" >&2; exit 1; }
+CURR_IDX=$(( RANDOM % ${#SEARCH_IDS[@]} ))
+
+# ── In-session stream URL cache + background prefetch ─────────────────────────
+declare -A STREAM_CACHE TITLE_CACHE DUR_CACHE
+PREFETCH_IDX=-1
+PREFETCH_FILE="/tmp/play_pre_$$"
+PREFETCH_PID=""
+
+# Map a SEARCH_IDS entry to a yt-dlp target for the active provider.
+provider_target() {
+    case "$PLAY_PROVIDER" in
+        spotify)    printf 'ytsearch1:%s' "$1" ;;   # id holds "name artist" query
+        soundcloud) printf '%s' "$1" ;;             # id holds the full soundcloud URL
+        *)          printf 'https://www.youtube.com/watch?v=%s' "$1" ;;
+    esac
+}
+
+start_prefetch() {
+    local idx="$1"
+    [ "$PREFETCH_IDX" -eq "$idx" ] 2>/dev/null && return
+    [ -n "$PREFETCH_PID" ] && kill "$PREFETCH_PID" 2>/dev/null
+    rm -f "$PREFETCH_FILE"; (( PREFETCH_IDX = idx )); PREFETCH_PID=""
+    [ -n "${STREAM_CACHE[$idx]:-}" ] && return
+    local yt_target; yt_target=$(provider_target "${SEARCH_IDS[$idx]}")
+    ( yt-dlp -f "bestaudio" --get-title --get-duration --get-url \
+          "$yt_target" 2>/dev/null > "$PREFETCH_FILE" ) &
+    PREFETCH_PID=$!
+}
+
+fetch_stream() {
+    local idx="$1"
+    STREAM=""; TITLE=""; DUR_STR=""
+    if [ -n "${STREAM_CACHE[$idx]:-}" ]; then
+        STREAM="${STREAM_CACHE[$idx]}"; TITLE="${TITLE_CACHE[$idx]}"; DUR_STR="${DUR_CACHE[$idx]}"
+        return
+    fi
+    if [ "$PREFETCH_IDX" -eq "$idx" ] && [ -n "$PREFETCH_PID" ]; then
+        wait "$PREFETCH_PID" 2>/dev/null; PREFETCH_PID=""
+    fi
+    local r=""
+    if [ "$PREFETCH_IDX" -eq "$idx" ] && [ -s "$PREFETCH_FILE" ]; then
+        r=$(cat "$PREFETCH_FILE")
+    else
+        local yt_target; yt_target=$(provider_target "${SEARCH_IDS[$idx]}")
+        r=$(yt-dlp -f "bestaudio" --get-title --get-duration --get-url "$yt_target" 2>/dev/null)
+    fi
+    STREAM=$(printf '%s\n' "$r" | grep '^https' | head -1)
+    DUR_STR=$(printf '%s\n' "$r" | grep -E '^[0-9]+:[0-9]' | head -1)
+    TITLE=$(printf '%s\n' "$r" | grep -v '^https' | grep -Ev '^[0-9]+:[0-9]' | head -1)
+    case "$PLAY_PROVIDER" in spotify|soundcloud)
+        [ -z "$TITLE" ]   && TITLE="${SEARCH_TITLES[$idx]}"
+        [ -z "$DUR_STR" ] && DUR_STR="${SEARCH_DURS[$idx]}" ;;
+    esac
+    if [ -n "$STREAM" ] && [[ "$STREAM" == https* ]]; then
+        STREAM_CACHE[$idx]="$STREAM"; TITLE_CACHE[$idx]="$TITLE"; DUR_CACHE[$idx]="$DUR_STR"
+    fi
+}
+
+# ── Cleanup ───────────────────────────────────────────────────────────────────
+STTY_ORIG=$(stty -g 2>/dev/null)
+PLAYLIST=""; IPC_FIFO=""; BRIDGE_PID=""; MPV_PID=""
+
+cleanup() {
+    trap - INT TERM
+    [ -n "$STTY_ORIG" ] && stty "$STTY_ORIG" 2>/dev/null
+    tput cnorm 2>/dev/null
+    exec 5>&-
+    [ -n "$BRIDGE_PID" ]   && kill "$BRIDGE_PID" 2>/dev/null
+    [ -n "$PREFETCH_PID" ] && kill "$PREFETCH_PID" 2>/dev/null
+    [ -n "$IPC_FIFO" ]     && rm -f "$IPC_FIFO"
+    [ -n "$PLAYLIST" ]     && rm -f "$PLAYLIST"
+    rm -f "$PREFETCH_FILE"
+    if [ "${PLAY_AUDIO:-wsl}" = "wsl" ]; then
+        taskkill.exe /IM mpv.exe /F >/dev/null 2>&1
+    else
+        [ -n "$MPV_PID" ] && kill "$MPV_PID" 2>/dev/null
+    fi
+    printf "\r\033[K\n"
+    if [ -n "$TMUX" ]; then
+        local sname; sname=$(tmux display-message -p '#{session_name}' 2>/dev/null)
+        [ "$sname" = "music" ] && tmux kill-session -t music 2>/dev/null
+    fi
+    exit 0
+}
+trap cleanup INT TERM
+
+ipc() { printf '{"command":[%s]}\n' "$*" >&5 2>/dev/null; }
+
+dur2s() {
+    local s=0; IFS=: read -ra p <<< "$1"
+    for x in "${p[@]}"; do s=$((s*60 + 10#$x)); done; echo $s
+}
+
+# ── Settings menu ─────────────────────────────────────────────────────────────
+# Returns 0 = closed, 2 = provider changed (needs re-search)
+show_settings() {
+    local -a PROVIDERS=(youtube spotify soundcloud)
+    local -a AUDIOS=(wsl native)
+    local -a POSITIONS=(top bottom left right)
+    local sel=0 pi=0 ai=0 posi=0 sz="$PLAY_SIZE"
+    local cid="${SPOTIFY_CLIENT_ID:-}" csec="${SPOTIFY_CLIENT_SECRET:-}"
+    local old_provider="$PLAY_PROVIDER" key seq j max_sel
+
+    for j in "${!PROVIDERS[@]}"; do [ "${PROVIDERS[$j]}" = "$PLAY_PROVIDER" ] && pi=$j; done
+    for j in "${!AUDIOS[@]}";    do [ "${AUDIOS[$j]}"    = "$PLAY_AUDIO"    ] && ai=$j; done
+    for j in "${!POSITIONS[@]}"; do [ "${POSITIONS[$j]}" = "$PLAY_POS"      ] && posi=$j; done
+
+    # Build display value for a cycle-type row
+    _cycle_val() {
+        local cur_i="$1"; shift
+        local out="" j=0
+        for opt in "$@"; do
+            [ $j -eq "$cur_i" ] \
+                && out+="$(printf '\033[1m[%s]\033[0m ' "$opt")" \
+                || out+="$(printf '\033[2m%s\033[0m ' "$opt")"
+            j=$(( j+1 ))
+        done
+        printf '%s' "$out"
+    }
+
+    while true; do
+        [ "${PROVIDERS[$pi]}" = "spotify" ] && max_sel=5 || max_sel=3
+        [ $sel -gt $max_sel ] && sel=$max_sel
+
+        clear
+        printf "\033[2m  ↑↓:nav  ←→:cycle  type:edit  Esc:close\033[0m\n\n"
+
+        local items=()
+        items+=("Provider" "$(_cycle_val $pi "${PROVIDERS[@]}")")
+        items+=("Audio"    "$(_cycle_val $ai "${AUDIOS[@]}")")
+        items+=("Size"     "$([ $sel -eq 2 ] && printf '\033[1m%s%%\033[0m▌' "$sz" || printf '%s%%' "$sz")")
+        items+=("Position" "$(_cycle_val $posi "${POSITIONS[@]}")")
+        if [ "${PROVIDERS[$pi]}" = "spotify" ]; then
+            local cid_disp csec_disp mask
+            [ $sel -eq 4 ] \
+                && cid_disp="$(printf '\033[1m%s\033[0m▌' "$cid")" \
+                || { [ -n "$cid" ] && cid_disp="$cid" || cid_disp=$'\033[31m(not set)\033[0m'; }
+            mask=$(printf '%*s' "${#csec}" '' | tr ' ' '•')
+            [ $sel -eq 5 ] \
+                && csec_disp="$(printf '\033[1m%s\033[0m▌' "$csec")" \
+                || { [ -n "$csec" ] && csec_disp="$mask" || csec_disp=$'\033[31m(not set)\033[0m'; }
+            items+=("Client ID"     "$cid_disp")
+            items+=("Client Secret" "$csec_disp")
+        fi
+
+        local n=$(( ${#items[@]} / 2 ))
+        for (( i=0; i<n; i++ )); do
+            local label="${items[$(( i*2 ))]}" val="${items[$(( i*2+1 ))]}"
+            if [ $i -eq $sel ]; then
+                printf "  \033[1;36m▶ %-14s\033[0m  %b\n" "$label:" "$val"
+            else
+                printf "     \033[2m%-14s\033[0m  %b\n" "$label:" "$val"
+            fi
+        done
+
+        if [ "${PROVIDERS[$pi]}" = "spotify" ]; then
+            printf "\n  \033[2mFree API key (no Premium): developer.spotify.com/dashboard\033[0m\n"
+        fi
+        printf "\n  \033[2mSize/position take effect on restart.\033[0m\n"
+
+        IFS= read -rsn1 -t 60 key 2>/dev/null || break
+        case "$key" in
+            $'\x1b')
+                IFS= read -rsn2 -t 0.05 seq 2>/dev/null || true
+                case "$seq" in
+                    '[A') [ $sel -gt 0 ] && (( sel-- )) ;;
+                    '[B') [ $sel -lt $max_sel ] && (( sel++ )) ;;
+                    '[C') case $sel in
+                              0) pi=$(( (pi + 1) % ${#PROVIDERS[@]} )) ;;
+                              1) ai=$(( (ai + 1) % ${#AUDIOS[@]} )) ;;
+                              2) [[ "$sz" =~ ^[0-9]+$ ]] && sz=$(( sz + 5 )); [ "$sz" -gt 80 ] && sz=80 ;;
+                              3) posi=$(( (posi + 1) % ${#POSITIONS[@]} )) ;;
+                          esac ;;
+                    '[D') case $sel in
+                              0) pi=$(( (pi - 1 + ${#PROVIDERS[@]}) % ${#PROVIDERS[@]} )) ;;
+                              1) ai=$(( (ai - 1 + ${#AUDIOS[@]}) % ${#AUDIOS[@]} )) ;;
+                              2) [[ "$sz" =~ ^[0-9]+$ ]] && sz=$(( sz - 5 )); [ "$sz" -lt 5 ] && sz=5 ;;
+                              3) posi=$(( (posi - 1 + ${#POSITIONS[@]}) % ${#POSITIONS[@]} )) ;;
+                          esac ;;
+                    '') break ;;
+                esac ;;
+            $'\x7f'|$'\x08')
+                case $sel in
+                    2) sz="${sz%?}" ;;
+                    4) cid="${cid%?}" ;;
+                    5) csec="${csec%?}" ;;
+                esac ;;
+            ''|$'\n'|$'\r') break ;;
+            *)
+                [[ "$key" =~ ^[[:print:]]$ ]] || continue
+                case $sel in
+                    2) [[ "$key" =~ ^[0-9]$ ]] && sz="${sz}${key}" ;;
+                    4) cid="${cid}${key}" ;;
+                    5) csec="${csec}${key}" ;;
+                esac ;;
+        esac
+    done
+
+    PLAY_PROVIDER="${PROVIDERS[$pi]}"
+    PLAY_AUDIO="${AUDIOS[$ai]}"
+    [[ "$sz" =~ ^[0-9]+$ ]] && PLAY_SIZE="$sz"
+    PLAY_POS="${POSITIONS[$posi]}"
+    SPOTIFY_CLIENT_ID="$cid"
+    SPOTIFY_CLIENT_SECRET="$csec"
+    save_config
+
+    [ "$PLAY_PROVIDER" != "$old_provider" ] && return 2
+    return 0
+}
+
+# ── Arrow-navigable list UI ───────────────────────────────────────────────────
+show_list() {
+    local sel=$CURR_IDX mode="nav" sbuf="" total=${#SEARCH_IDS[@]} offset=0
+    while true; do
+        local rows; rows=$(tput lines 2>/dev/null || echo 10)
+        local cols; cols=$(tput cols  2>/dev/null || echo 80)
+        local list_rows=$(( rows - 3 )); [ $list_rows -lt 1 ] && list_rows=1
+        [ $list_rows -gt $total ] && list_rows=$total
+
+        [ $sel -lt $offset ] && offset=$sel
+        [ $sel -ge $(( offset + list_rows )) ] && offset=$(( sel - list_rows + 1 ))
+        [ $offset -lt 0 ] && offset=0
+
+        clear
+        printf "\033[2m  ↑↓:nav  Enter:play  Esc:back\033[0m\n\n"
+        local dmax=0
+        for d in "${SEARCH_DURS[@]}"; do [ ${#d} -gt $dmax ] && dmax=${#d}; done
+        local tmax=$(( cols - 12 - dmax )); [ $tmax -lt 10 ] && tmax=10
+        for (( i=offset; i<offset+list_rows && i<total; i++ )); do
+            local t="${SEARCH_TITLES[$i]}"
+            [ ${#t} -gt $tmax ] && t="${t:0:$tmax}…"
+            if [ $i -eq $sel ]; then
+                printf "  \033[1;36m▶ %2d. %-*s\033[0m \033[2m%s\033[0m\n" \
+                    "$((i+1))" "$tmax" "$t" "${SEARCH_DURS[$i]}"
+            else
+                printf "     %2d. %-*s \033[2m%s\033[0m\n" \
+                    "$((i+1))" "$tmax" "$t" "${SEARCH_DURS[$i]}"
+            fi
+        done
+        printf "\n"
+        if [ "$mode" = "search" ]; then
+            printf "  Search: \033[1m%s\033[0m▌" "$sbuf"
+        else
+            local page=""
+            [ $total -gt $list_rows ] && page=$(printf "%d–%d / %d  " \
+                "$((offset+1))" "$(( offset+list_rows < total ? offset+list_rows : total ))" "$total")
+            printf "  \033[2m%stype to search\033[0m" "$page"
+        fi
+
+        IFS= read -rsn1 -t 60 key 2>/dev/null || return 1
+        case "$key" in
+            $'\x1b')
+                IFS= read -rsn2 -t 0.05 seq 2>/dev/null || true
+                case "$seq" in
+                    '[A') mode="nav"; [ $sel -gt 0 ] && (( sel-- )) ;;
+                    '[B') mode="nav"; [ $sel -lt $(( total-1 )) ] && (( sel++ )) ;;
+                    '') return 1 ;;
+                esac ;;
+            ''|$'\n'|$'\r')
+                if [ "$mode" = "search" ] && [ -n "$sbuf" ]; then
+                    QUERY="$sbuf"
+                    clear
+                    printf "\n  Searching: \033[1m%s\033[0m\n\n" "$QUERY"
+                    local spin=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+                    local si=0
+                    do_search "$QUERY" &>/dev/null &
+                    local spid=$!
+                    while kill -0 $spid 2>/dev/null; do
+                        printf "\r  %s  searching..." "${spin[$si]}"
+                        si=$(( (si+1) % 10 ))
+                        sleep 0.1
+                    done
+                    wait $spid
+                    printf "\r\033[K"
+                    if [ ${#SEARCH_IDS[@]} -gt 0 ]; then
+                        sel=0; total=${#SEARCH_IDS[@]}; offset=0; sbuf=""; mode="nav"
+                    else
+                        printf "  No results found.\n"; sleep 1.5; sbuf=""; mode="nav"
+                    fi
+                else
+                    CURR_IDX=$sel; return 0
+                fi ;;
+            $'\x7f'|$'\x08')
+                if [ -n "$sbuf" ]; then sbuf="${sbuf%?}"; [ -z "$sbuf" ] && mode="nav"; fi ;;
+            *)  [[ "$key" =~ ^[[:print:]]$ ]] && { mode="search"; sbuf="$sbuf$key"; } ;;
+        esac
+    done
+}
+
+# ── Player display ────────────────────────────────────────────────────────────
+show_player_display() {
+    clear
+    local rows; rows=$(tput lines 2>/dev/null || echo 10)
+    local cols; cols=$(tput cols  2>/dev/null || echo 80)
+    local tmax=$(( cols - 6 ))
+    local t="${TITLE:-$ID}"; [ ${#t} -gt $tmax ] && t="${t:0:$tmax}…"
+    local src=""
+    case "$PLAY_PROVIDER" in
+        spotify)    src=" \033[32m[spotify]\033[0m" ;;
+        soundcloud) src=" \033[38;5;208m[soundcloud]\033[0m" ;;
+    esac
+    if [ "$rows" -le 5 ]; then
+        printf "\033[1;36m♪ %s\033[0m${src} \033[2m[%d/%d]\033[0m\n" \
+            "$t" "$((CURR_IDX+1))" "${#SEARCH_IDS[@]}"
+        printf "\033[2m←→:seek ↑↓:vol Space:pause n/p l s:cfg q\033[0m\n"
+    else
+        printf "\n\033[1;36m  ♪ %s\033[0m${src}\n" "$t"
+        printf "  \033[2m%s  [%d/%d]\033[0m\n" "${DUR_STR:-?}" "$((CURR_IDX+1))" "${#SEARCH_IDS[@]}"
+        printf "  \033[2m←→:seek ↑↓:vol Space:pause n/p:trk l:list s:settings q:quit\033[0m\n\n"
+    fi
+}
+
+# ── Start mpv + IPC bridge ────────────────────────────────────────────────────
+MPV_SOCKET=""
+start_mpv() {
+    [ -n "$IPC_FIFO" ] && rm -f "$IPC_FIFO"
+    IPC_FIFO=$(mktemp -u /tmp/mpv_ipc_XXXXXX); mkfifo "$IPC_FIFO"
+    [ -n "$BRIDGE_PID" ] && kill "$BRIDGE_PID" 2>/dev/null
+
+    if [ "$PLAY_AUDIO" = "wsl" ]; then
+        PLAYLIST="${WSL_TEMP}/yt_play_$$.m3u"
+        WIN_PLAYLIST="${WIN_TEMP}\\yt_play_$$.m3u"
+        printf '%s\n' "$STREAM" > "$PLAYLIST"
+        PIPE_NAME="mpvsocket_$$_${CURR_IDX}"
+        "$MPV_WIN" --no-video --really-quiet --force-window=no \
+            '--input-ipc-server=\\.\pipe\'"$PIPE_NAME" \
+            "$WIN_PLAYLIST" &
+        MPV_PID=$!
+        sleep 1.5
+        powershell.exe -NoProfile -Command "
+            try {
+                \$np = New-Object System.IO.Pipes.NamedPipeClientStream('.', '${PIPE_NAME}', [System.IO.Pipes.PipeDirection]::Out)
+                \$np.Connect(3000)
+                \$sw = New-Object System.IO.StreamWriter(\$np); \$sw.AutoFlush = \$true
+                while (\$null -ne (\$line = [Console]::In.ReadLine())) { \$sw.WriteLine(\$line) }
+                \$np.Close()
+            } catch {}
+        " < "$IPC_FIFO" &
+        BRIDGE_PID=$!
+    else
+        MPV_SOCKET="/tmp/mpvsocket_$$"
+        rm -f "$MPV_SOCKET"
+        "$LINUX_MPV" --no-video --really-quiet \
+            "--input-ipc-server=$MPV_SOCKET" "$STREAM" &
+        MPV_PID=$!
+        local t=0
+        while [ ! -S "$MPV_SOCKET" ] && kill -0 $MPV_PID 2>/dev/null && [ $t -lt 50 ]; do
+            sleep 0.1; t=$((t+1))
+        done
+        python3 - "$MPV_SOCKET" < "$IPC_FIFO" <<'PYEOF' &
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+    s.connect(sys.argv[1])
+    for line in sys.stdin.buffer: s.sendall(line)
+finally:
+    s.close()
+PYEOF
+        BRIDGE_PID=$!
+    fi
+    exec 5>"$IPC_FIFO"
+}
+
+# ── Main loop ─────────────────────────────────────────────────────────────────
+ACTION="play"
+
+while true; do
+    case "$ACTION" in
+        next) CURR_IDX=$(( (CURR_IDX + 1) % ${#SEARCH_IDS[@]} )) ;;
+        prev) CURR_IDX=$(( (CURR_IDX - 1 + ${#SEARCH_IDS[@]}) % ${#SEARCH_IDS[@]} )) ;;
+    esac
+
+    ID="${SEARCH_IDS[$CURR_IDX]}"
+    clear
+    printf "  Loading [%d/%d] %s\n" "$((CURR_IDX+1))" "${#SEARCH_IDS[@]}" "${SEARCH_TITLES[$CURR_IDX]}"
+
+    fetch_stream "$CURR_IDX"
+
+    if [ -z "$STREAM" ] || [[ "$STREAM" != https* ]]; then
+        printf "  Skipping...\n"; sleep 1; ACTION="next"; continue
+    fi
+    DUR_SECS=$(dur2s "$DUR_STR")
+
+    start_mpv
+    start_prefetch $(( (CURR_IDX + 1) % ${#SEARCH_IDS[@]} ))
+
+    show_player_display
+    while IFS= read -rsn1 -t 0 _ 2>/dev/null; do :; done
+    stty -echo -icanon min 0 time 0 2>/dev/null
+    tput civis 2>/dev/null
+    START=$(date +%s); PAUSED=0; PAUSE_AT=0
+    ACTION="next"
+
+    while kill -0 $MPV_PID 2>/dev/null; do
+        NOW=$(date +%s)
+        [ $PAUSED -eq 0 ] && ELAPSED=$((NOW - START)) || ELAPSED=$PAUSE_AT
+
+        cols=$(tput cols 2>/dev/null || echo 80)
+        bw=$(( cols - 30 )); [ $bw -lt 8 ] && bw=8; [ $bw -gt 40 ] && bw=40
+        if [ $DUR_SECS -gt 0 ]; then
+            PCT=$(( ELAPSED * 100 / DUR_SECS )); [ $PCT -gt 100 ] && PCT=100
+            fill=$(( PCT * bw / 100 ))
+            BAR=""; for ((i=0; i<bw; i++)); do ((i<fill)) && BAR+="█" || BAR+="░"; done
+            PIND=""; [ $PAUSED -eq 1 ] && PIND="⏸ "
+            printf "\r  ${PIND}\033[33m%02d:%02d\033[0m/%s \033[36m[%s]\033[0m %3d%%" \
+                $((ELAPSED/60)) $((ELAPSED%60)) "$DUR_STR" "$BAR" "$PCT"
+        else
+            printf "\r  \033[33m%02d:%02d\033[0m playing..." $((ELAPSED/60)) $((ELAPSED%60))
+        fi
+
+        IFS= read -rsn1 -t 0.2 key 2>/dev/null || true
+        case "$key" in
+            q|Q) ACTION="quit"; break ;;
+            n|N) ACTION="next"; break ;;
+            p|P) ACTION="prev"; break ;;
+            l|L)
+                stty "$STTY_ORIG" 2>/dev/null; tput cnorm 2>/dev/null
+                if show_list; then ACTION="play"; break; fi
+                show_player_display
+                while IFS= read -rsn1 -t 0 _ 2>/dev/null; do :; done
+                stty -echo -icanon min 0 time 0 2>/dev/null
+                tput civis 2>/dev/null ;;
+            s|S)
+                stty "$STTY_ORIG" 2>/dev/null; tput cnorm 2>/dev/null
+                show_settings
+                if [ $? -eq 2 ]; then
+                    clear; printf "  Switching to provider: %s\n" "$PLAY_PROVIDER"
+                    do_search "$QUERY"
+                    if [ ${#SEARCH_IDS[@]} -gt 0 ]; then CURR_IDX=0; ACTION="play"; break; fi
+                fi
+                show_player_display
+                while IFS= read -rsn1 -t 0 _ 2>/dev/null; do :; done
+                stty -echo -icanon min 0 time 0 2>/dev/null
+                tput civis 2>/dev/null ;;
+            ' ')
+                ipc '"cycle","pause"'
+                [ $PAUSED -eq 0 ] && { PAUSED=1; PAUSE_AT=$ELAPSED; } \
+                                  || { PAUSED=0; START=$((NOW - PAUSE_AT)); } ;;
+            $'\x1b')
+                IFS= read -rsn2 -t 0.05 seq 2>/dev/null || true
+                case "$seq" in
+                    '[A') ipc '"add","volume",5' ;;
+                    '[B') ipc '"add","volume",-5' ;;
+                    '[C') ipc '"seek","10","relative"'; [ $PAUSED -eq 0 ] && START=$((START-10)) ;;
+                    '[D') ipc '"seek","-10","relative"'; [ $PAUSED -eq 0 ] && START=$((START+10)) ;;
+                esac ;;
+        esac
+    done
+
+    stty "$STTY_ORIG" 2>/dev/null; tput cnorm 2>/dev/null
+    exec 5>&-
+    kill "$BRIDGE_PID" 2>/dev/null; BRIDGE_PID=""
+    rm -f "$PLAYLIST" "$IPC_FIFO" "$MPV_SOCKET"; PLAYLIST=""; IPC_FIFO=""; MPV_PID=""; MPV_SOCKET=""
+    [ "$PLAY_AUDIO" = "wsl" ] && taskkill.exe /IM mpv.exe /F >/dev/null 2>&1
+
+    [ "$ACTION" = "quit" ] && break
+done
+
+cleanup
