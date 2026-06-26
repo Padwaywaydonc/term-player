@@ -282,7 +282,9 @@ STTY_ORIG=$(stty -g 2>/dev/null)
 PLAYLIST=""; IPC_FIFO=""; BRIDGE_PID=""; MPV_PID=""
 
 cleanup() {
-    trap - INT TERM
+    [ -n "${_CLEANED:-}" ] && return   # idempotent: trap + explicit call must not double-run
+    _CLEANED=1
+    trap - INT TERM HUP
     [ -n "$STTY_ORIG" ] && stty "$STTY_ORIG" 2>/dev/null
     tput cnorm 2>/dev/null
     exec 5>&-
@@ -303,7 +305,10 @@ cleanup() {
     fi
     exit 0
 }
-trap cleanup INT TERM
+# HUP is essential: closing the terminal / killing the `music` tmux session
+# delivers SIGHUP (verified) — without trapping it, the script dies before
+# cleanup runs and the Windows mpv.exe keeps playing as an orphan.
+trap cleanup INT TERM HUP
 
 ipc() { printf '{"command":[%s]}\n' "$*" >&5 2>/dev/null; }
 
