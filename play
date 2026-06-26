@@ -206,7 +206,10 @@ PYEOF
                 "scsearch${COUNT}:${q}" 2>/dev/null > "$cache_file"
         else
             printf "\033[1m  Searching:\033[0m %s\n" "$q"
-            yt-dlp --print "%(id)s|%(title)s|%(duration_string)s" \
+            # --flat-playlist: list entries only (id/title/duration) without
+            # resolving each video — ~4s vs ~60s. Stream URLs are fetched
+            # lazily later in fetch_stream via --get-url.
+            yt-dlp --flat-playlist --print "%(id)s|%(title)s|%(duration_string)s" \
                 "ytsearch${COUNT}:${q}" 2>/dev/null > "$cache_file"
         fi
         [ -s "$cache_file" ] || { rm -f "$cache_file"; return 1; }
@@ -487,23 +490,19 @@ show_list() {
                     QUERY="$sbuf"
                     clear
                     printf "\n  Searching: \033[1m%s\033[0m\n\n" "$QUERY"
-                    local spin=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
-                    local si=0
-                    # Warm the disk cache in the background so we can spin a
-                    # spinner; then run do_search in THIS shell so its array
-                    # updates (SEARCH_IDS/TITLES/DURS) actually take effect.
-                    # Running it only in the backgrounded subshell would lose
-                    # them, leaving the list — and the selection — on the old
-                    # results. The foreground call is a cache hit (cheap).
-                    ( do_search "$QUERY" ) &>/dev/null &
-                    local spid=$!
-                    while kill -0 $spid 2>/dev/null; do
-                        printf "\r  %s  searching..." "${spin[$si]}"
-                        si=$(( (si+1) % 10 ))
-                        sleep 0.1
-                    done
-                    wait $spid
+                    # Run the search in THIS shell so its array updates
+                    # (SEARCH_IDS/TITLES/DURS) take effect here — a backgrounded
+                    # subshell would lose them, leaving the list and the
+                    # selection stuck on the old results. Animate the spinner in
+                    # a background subshell instead, and stop it when we're done.
+                    ( while :; do
+                          for f in ⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏; do
+                              printf "\r  %s  searching..." "$f"; sleep 0.1
+                          done
+                      done ) &
+                    local spinpid=$!
                     do_search "$QUERY" &>/dev/null
+                    kill "$spinpid" 2>/dev/null; wait "$spinpid" 2>/dev/null
                     printf "\r\033[K"
                     if [ ${#SEARCH_IDS[@]} -gt 0 ]; then
                         sel=0; total=${#SEARCH_IDS[@]}; offset=0; sbuf=""; mode="nav"
