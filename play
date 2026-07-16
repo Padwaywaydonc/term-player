@@ -534,7 +534,7 @@ show_player_display() {
     if [ "$rows" -le 5 ]; then
         printf "\033[1;36m♪ %s\033[0m${src} \033[2m[%d/%d]\033[0m\n" \
             "$t" "$((CURR_IDX+1))" "${#SEARCH_IDS[@]}"
-        printf "\033[2m←→:seek ↑↓:vol Space:pause n/p l s:cfg q\033[0m\n"
+        printf "\033[2m←→:seek ↑↓:vol Space:pause n/p:trk l:list s:cfg q:quit\033[0m\n"
     else
         printf "\n\033[1;36m  ♪ %s\033[0m${src}\n" "$t"
         printf "  \033[2m%s  [%d/%d]\033[0m\n" "${DUR_STR:-?}" "$((CURR_IDX+1))" "${#SEARCH_IDS[@]}"
@@ -543,6 +543,20 @@ show_player_display() {
 }
 
 # ── Start mpv + IPC bridge ────────────────────────────────────────────────────
+# Built as a variable (not a heredoc on the same command line) because a
+# heredoc redirect and a file redirect both targeting stdin on one command
+# conflict: bash applies redirects left-to-right, so the heredoc silently
+# wins and python's sys.stdin becomes its own already-consumed source text
+# instead of the IPC_FIFO — the bridge connects but never relays anything.
+PY_BRIDGE_CODE='
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+    s.connect(sys.argv[1])
+    for line in sys.stdin.buffer: s.sendall(line)
+finally:
+    s.close()
+'
 MPV_SOCKET=""
 start_mpv() {
     [ -n "$IPC_FIFO" ] && rm -f "$IPC_FIFO"
@@ -579,22 +593,16 @@ start_mpv() {
         while [ ! -S "$MPV_SOCKET" ] && kill -0 $MPV_PID 2>/dev/null && [ $t -lt 50 ]; do
             sleep 0.1; t=$((t+1))
         done
-        python3 - "$MPV_SOCKET" < "$IPC_FIFO" <<'PYEOF' &
-import socket, sys
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-try:
-    s.connect(sys.argv[1])
-    for line in sys.stdin.buffer: s.sendall(line)
-finally:
-    s.close()
-PYEOF
+        python3 -c "$PY_BRIDGE_CODE" "$MPV_SOCKET" < "$IPC_FIFO" &
         BRIDGE_PID=$!
     fi
     exec 5>"$IPC_FIFO"
+    ipc '"set","volume",'"$VOLUME"
 }
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 ACTION="play"
+VOLUME=100   # persists across tracks — each track spawns a fresh mpv, applied via start_mpv
 
 while true; do
     case "$ACTION" in
@@ -628,16 +636,17 @@ while true; do
         [ $PAUSED -eq 0 ] && ELAPSED=$((NOW - START)) || ELAPSED=$PAUSE_AT
 
         cols=$(tput cols 2>/dev/null || echo 80)
-        bw=$(( cols - 30 )); [ $bw -lt 8 ] && bw=8; [ $bw -gt 40 ] && bw=40
+        bw=$(( cols - 40 )); [ $bw -lt 8 ] && bw=8; [ $bw -gt 40 ] && bw=40
         if [ $DUR_SECS -gt 0 ]; then
             PCT=$(( ELAPSED * 100 / DUR_SECS )); [ $PCT -gt 100 ] && PCT=100
             fill=$(( PCT * bw / 100 ))
             BAR=""; for ((i=0; i<bw; i++)); do ((i<fill)) && BAR+="█" || BAR+="░"; done
             PIND=""; [ $PAUSED -eq 1 ] && PIND="⏸ "
-            printf "\r  ${PIND}\033[33m%02d:%02d\033[0m/%s \033[36m[%s]\033[0m %3d%%" \
-                $((ELAPSED/60)) $((ELAPSED%60)) "$DUR_STR" "$BAR" "$PCT"
+            printf "\r  ${PIND}\033[33m%02d:%02d\033[0m/%s \033[36m[%s]\033[0m %3d%% \033[35m♪%3d%%\033[0m" \
+                $((ELAPSED/60)) $((ELAPSED%60)) "$DUR_STR" "$BAR" "$PCT" "$VOLUME"
         else
-            printf "\r  \033[33m%02d:%02d\033[0m playing..." $((ELAPSED/60)) $((ELAPSED%60))
+            printf "\r  \033[33m%02d:%02d\033[0m playing... \033[35m♪%3d%%\033[0m" \
+                $((ELAPSED/60)) $((ELAPSED%60)) "$VOLUME"
         fi
 
         IFS= read -rsn1 -t 0.2 key 2>/dev/null || true
@@ -671,10 +680,22 @@ while true; do
             $'\x1b')
                 IFS= read -rsn2 -t 0.05 seq 2>/dev/null || true
                 case "$seq" in
-                    '[A') ipc '"add","volume",5' ;;
-                    '[B') ipc '"add","volume",-5' ;;
-                    '[C') ipc '"seek","10","relative"'; [ $PAUSED -eq 0 ] && START=$((START-10)) ;;
-                    '[D') ipc '"seek","-10","relative"'; [ $PAUSED -eq 0 ] && START=$((START+10)) ;;
+                    '[A') VOLUME=$((VOLUME+5)); [ $VOLUME -gt 130 ] && VOLUME=130
+                          ipc '"set","volume",'"$VOLUME" ;;
+                    '[B') VOLUME=$((VOLUME-5)); [ $VOLUME -lt 0 ] && VOLUME=0
+                          ipc '"set","volume",'"$VOLUME" ;;
+                    '[C') ipc '"seek","10","relative"'
+                          if [ $PAUSED -eq 1 ]; then
+                              PAUSE_AT=$((PAUSE_AT+10)); [ $DUR_SECS -gt 0 ] && [ $PAUSE_AT -gt $DUR_SECS ] && PAUSE_AT=$DUR_SECS
+                          else
+                              START=$((START-10))
+                          fi ;;
+                    '[D') ipc '"seek","-10","relative"'
+                          if [ $PAUSED -eq 1 ]; then
+                              PAUSE_AT=$((PAUSE_AT-10)); [ $PAUSE_AT -lt 0 ] && PAUSE_AT=0
+                          else
+                              START=$((START+10))
+                          fi ;;
                 esac ;;
         esac
     done
