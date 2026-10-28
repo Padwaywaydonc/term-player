@@ -36,10 +36,12 @@ mkdir -p "$WORK/bin" "$WORK/home/.config" "$WORK/home/.cache"
 cat > "$WORK/bin/yt-dlp" <<'YTEOF'
 #!/usr/bin/env bash
 last="${@: -1}"
-if [[ "$*" == *"--get-url"* ]]; then
+if [[ "$*" == *"after_move:filepath"* ]]; then
     printf 'TRACK\n'
-    printf 'https://stream.test/1\n'
+    tpl=""; prev=""; for a in "$@"; do [ "$prev" = "-o" ] && tpl="$a"; prev="$a"; done
+    f="${tpl%/*}/1.webm"; echo audio > "$f"
     printf '3:00\n'
+    printf '%s\n' "$f"
     exit 0
 fi
 for i in $(seq 1 10); do

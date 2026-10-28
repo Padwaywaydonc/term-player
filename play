@@ -228,7 +228,20 @@ CURR_IDX=$(( RANDOM % ${#SEARCH_IDS[@]} ))
 declare -A STREAM_CACHE TITLE_CACHE DUR_CACHE
 PREFETCH_IDX=-1
 PREFETCH_FILE="/tmp/play_pre_$$"
+# Tracks are downloaded before playing: YouTube stream URLs now reject the HTTP
+# Range requests mpv makes (403 mid-track), while yt-dlp's chunked downloader
+# works. A local file also gives instant seeking. In WSL it sits in Windows
+# %TEMP% so mpv.exe reads it natively.
+AUDIO_DIR="${WSL_TEMP:-/tmp}/play_audio_$$"
+mkdir -p "$AUDIO_DIR"
 PREFETCH_PID=""
+
+# Download a track; prints title, duration, then the local file path.
+download_track() {
+    # Live streams never finish downloading: filter them out (track gets skipped).
+    yt-dlp -f "bestaudio" --match-filters "!is_live" --no-simulate -o "$AUDIO_DIR/%(id)s.%(ext)s" \
+        --print title --print duration_string --print after_move:filepath "$1" 2>/dev/null
+}
 
 # Map a SEARCH_IDS entry to a yt-dlp target for the active provider.
 provider_target() {
@@ -246,8 +259,7 @@ start_prefetch() {
     rm -f "$PREFETCH_FILE"; (( PREFETCH_IDX = idx )); PREFETCH_PID=""
     [ -n "${STREAM_CACHE[$idx]:-}" ] && return
     local yt_target; yt_target=$(provider_target "${SEARCH_IDS[$idx]}")
-    ( yt-dlp -f "bestaudio" --get-title --get-duration --get-url \
-          "$yt_target" 2>/dev/null > "$PREFETCH_FILE" ) &
+    ( download_track "$yt_target" > "$PREFETCH_FILE" ) &
     PREFETCH_PID=$!
 }
 
@@ -266,16 +278,16 @@ fetch_stream() {
         r=$(cat "$PREFETCH_FILE")
     else
         local yt_target; yt_target=$(provider_target "${SEARCH_IDS[$idx]}")
-        r=$(yt-dlp -f "bestaudio" --get-title --get-duration --get-url "$yt_target" 2>/dev/null)
+        r=$(download_track "$yt_target")
     fi
-    STREAM=$(printf '%s\n' "$r" | grep '^https' | head -1)
+    STREAM=$(printf '%s\n' "$r" | grep -F "$AUDIO_DIR/" | tail -1)
     DUR_STR=$(printf '%s\n' "$r" | grep -E '^[0-9]+:[0-9]' | head -1)
-    TITLE=$(printf '%s\n' "$r" | grep -v '^https' | grep -Ev '^[0-9]+:[0-9]' | head -1)
+    TITLE=$(printf '%s\n' "$r" | grep -vF "$AUDIO_DIR/" | grep -Ev '^[0-9]+:[0-9]' | head -1)
     case "$PLAY_PROVIDER" in spotify|soundcloud)
         [ -z "$TITLE" ]   && TITLE="${SEARCH_TITLES[$idx]}"
         [ -z "$DUR_STR" ] && DUR_STR="${SEARCH_DURS[$idx]}" ;;
     esac
-    if [ -n "$STREAM" ] && [[ "$STREAM" == https* ]]; then
+    if [ -s "$STREAM" ]; then
         STREAM_CACHE[$idx]="$STREAM"; TITLE_CACHE[$idx]="$TITLE"; DUR_CACHE[$idx]="$DUR_STR"
     fi
 }
@@ -301,6 +313,7 @@ cleanup() {
     else
         [ -n "$MPV_PID" ] && kill "$MPV_PID" 2>/dev/null
     fi
+    rm -rf "$AUDIO_DIR"   # after mpv exits: Windows won't delete an open file
     printf "\r\033[K\n"
     if [ -n "$TMUX" ]; then
         local sname; sname=$(tmux display-message -p '#{session_name}' 2>/dev/null)
@@ -566,7 +579,7 @@ start_mpv() {
     if [ "$PLAY_AUDIO" = "wsl" ]; then
         PLAYLIST="${WSL_TEMP}/yt_play_$$.m3u"
         WIN_PLAYLIST="${WIN_TEMP}\\yt_play_$$.m3u"
-        printf '%s\n' "$STREAM" > "$PLAYLIST"
+        wslpath -w "$STREAM" > "$PLAYLIST"
         PIPE_NAME="mpvsocket_$$_${CURR_IDX}"
         "$MPV_WIN" --no-video --really-quiet --force-window=no \
             '--input-ipc-server=\\.\pipe\'"$PIPE_NAME" \
@@ -616,7 +629,7 @@ while true; do
 
     fetch_stream "$CURR_IDX"
 
-    if [ -z "$STREAM" ] || [[ "$STREAM" != https* ]]; then
+    if [ ! -s "$STREAM" ]; then
         printf "  Skipping...\n"; sleep 1; ACTION="next"; continue
     fi
     DUR_SECS=$(dur2s "$DUR_STR")

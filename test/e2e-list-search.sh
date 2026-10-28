@@ -32,7 +32,7 @@ mkdir -p "$WORK/bin" "$WORK/home/.config" "$WORK/home/.cache"
 
 # ── Fake yt-dlp ───────────────────────────────────────────────────────────────
 # Search form: --print ... ytsearchN:QUERY  → 10 lines  id|title|dur
-# Stream form: --get-url ... <youtube url>  → title / https url / duration
+# Download form: --print ... -o <tpl> <youtube url>  → title / duration / file path
 cat > "$WORK/bin/yt-dlp" <<'YTEOF'
 #!/usr/bin/env bash
 args="$*"
@@ -47,7 +47,7 @@ name_for() {
     esac
 }
 
-if [[ "$args" == *"--get-url"* ]]; then
+if [[ "$args" == *"after_move:filepath"* ]]; then
     # last arg looks like https://www.youtube.com/watch?v=OLD3
     id="${last##*v=}"
     pfx="${id%%[0-9]*}"      # OLD / NEW / DEF
@@ -58,8 +58,10 @@ if [[ "$args" == *"--get-url"* ]]; then
         *)   disp="DEFSONG" ;;
     esac
     printf '%s %s\n' "$disp" "$num"   # title
-    printf 'https://stream.test/%s\n' "$id"
+    tpl=""; prev=""; for a in "$@"; do [ "$prev" = "-o" ] && tpl="$a"; prev="$a"; done
+    f="${tpl%/*}/$id.webm"; echo audio > "$f"
     printf '3:00\n'                    # duration
+    printf '%s\n' "$f"                 # downloaded file
     exit 0
 fi
 

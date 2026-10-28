@@ -39,11 +39,13 @@ cat > "$WORK/bin/yt-dlp" <<'YTEOF'
 #!/usr/bin/env bash
 args="$*"
 last="${@: -1}"
-if [[ "$args" == *"--get-url"* ]]; then
+if [[ "$args" == *"after_move:filepath"* ]]; then
     id="${last##*v=}"
     printf 'TRACK %s\n' "$id"
-    printf 'https://stream.test/%s\n' "$id"
+    tpl=""; prev=""; for a in "$@"; do [ "$prev" = "-o" ] && tpl="$a"; prev="$a"; done
+    f="${tpl%/*}/$id.webm"; echo audio > "$f"
     printf '3:00\n'
+    printf '%s\n' "$f"
     exit 0
 fi
 for i in 1 2; do
