@@ -5,3 +5,6 @@
 
 # Never commit user config (may contain Spotify credentials)
 play.conf
+
+# Python bytecode
+__pycache__/

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # play [--size N] [--pos top|bottom|left|right] [--audio wsl|native] [--provider youtube|spotify|soundcloud] <search>
+# play --tombola [--size N] [--pos ...] [--audio wsl|native]   generative bouncing-ball synth
 # ← →:seek  ↑ ↓:vol  Space:pause  n:next  p:prev  l:list  s:settings  q:quit
 
 COUNT=10
@@ -61,7 +62,13 @@ LINUX_MPV="${PLAY_MPV_LINUX:-$(detect_linux_mpv)}"
 MPV_WIN="${PLAY_MPV_WIN:-}"
 [ "$IS_WSL" = 1 ] && [ -z "$MPV_WIN" ] && MPV_WIN="$(detect_win_mpv)"
 
-if [ "$PLAY_AUDIO" = "wsl" ]; then
+# ── Tombola mode (generative synth) ───────────────────────────────────────────
+# Spotted up front: it needs neither yt-dlp nor the Windows temp dir, so the
+# music stack's checks below are skipped. It still opens in the same tmux split.
+TOMBOLA=0
+for _a in "$@"; do [ "$_a" = "--tombola" ] && TOMBOLA=1; done
+
+if [ "$PLAY_AUDIO" = "wsl" ] && [ "$TOMBOLA" = 0 ]; then
     WIN_TEMP="${PLAY_WIN_TEMP:-$(detect_win_temp)}"
     [ -n "$WIN_TEMP" ] && WSL_TEMP=$(wslpath "$WIN_TEMP" 2>/dev/null)
     [ -z "${WSL_TEMP:-}" ] && { WSL_TEMP=/tmp; WIN_TEMP=$(wslpath -w /tmp 2>/dev/null); }
@@ -86,7 +93,11 @@ check_deps() {
         exit 1
     fi
 }
-check_deps
+if [ "$TOMBOLA" = 1 ]; then
+    command -v python3 >/dev/null 2>&1 || { printf 'play: --tombola needs python3\n' >&2; exit 1; }
+else
+    check_deps
+fi
 
 # ── Config save (defined early so the tmux block can call it) ─────────────────
 save_config() {
@@ -108,7 +119,8 @@ while [[ "${1:-}" == --* ]]; do
         --pos)      PLAY_POS="$2";      shift 2 ;;
         --audio)    PLAY_AUDIO="$2";    shift 2 ;;
         --provider) PLAY_PROVIDER="$2"; shift 2 ;;
-        *) printf "Usage: play [--size N] [--pos top|bottom|left|right] [--audio wsl|native] [--provider youtube|spotify|soundcloud] <query>\n" >&2; exit 1 ;;
+        --tombola)  shift ;;
+        *) printf "Usage: play [--size N] [--pos top|bottom|left|right] [--audio wsl|native] [--provider youtube|spotify|soundcloud] [--tombola] <query>\n" >&2; exit 1 ;;
     esac
 done
 
@@ -117,7 +129,8 @@ if command -v tmux &>/dev/null && [ -z "$_PLAY_TMUX" ]; then
     save_config
     SELF=$(printf '%q' "$0")
     Q=$(printf '%q ' "$@")
-    CMD="env _PLAY_TMUX=1 $SELF --size $PLAY_SIZE --pos $PLAY_POS --audio $PLAY_AUDIO --provider $PLAY_PROVIDER $Q"
+    TB_FLAG=""; [ "$TOMBOLA" = 1 ] && TB_FLAG="--tombola"
+    CMD="env _PLAY_TMUX=1 $SELF --size $PLAY_SIZE --pos $PLAY_POS --audio $PLAY_AUDIO --provider $PLAY_PROVIDER $TB_FLAG $Q"
     TERM_SIZE=$(( 100 - PLAY_SIZE ))
     case "$PLAY_POS" in
         top|bottom) SFLAG="-v" ;;
@@ -149,6 +162,19 @@ if command -v tmux &>/dev/null && [ -z "$_PLAY_TMUX" ]; then
         esac
         exec tmux attach-session -t music
     fi
+fi
+
+# ── Tombola: run the synth in this pane, then tidy up like the player does ───
+if [ "$TOMBOLA" = 1 ]; then
+    TB_AUDIO="$PLAY_AUDIO"
+    [ "$TB_AUDIO" = "wsl" ] && [ -z "$MPV_WIN" ] && TB_AUDIO=native
+    python3 "$(dirname "$(readlink -f "$0")")/tombola" --audio "$TB_AUDIO" \
+        --mpv "$MPV_WIN" --linux-mpv "$LINUX_MPV"
+    rc=$?
+    if [ -n "$TMUX" ] && [ "$(tmux display-message -p '#{session_name}' 2>/dev/null)" = "music" ]; then
+        tmux kill-session -t music 2>/dev/null
+    fi
+    exit $rc
 fi
 
 trap '' PIPE

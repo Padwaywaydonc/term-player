@@ -85,6 +85,69 @@ play --size 25 --pos bottom synthwave   # 25%-tall pane along the bottom
 | `s`       | settings menu     |
 | `q`       | quit              |
 
+## Tombola — generative synth
+
+```bash
+play --tombola                 # opens in the same tmux split as the player
+play --tombola --size 40       # a taller pane for the full knob layout
+play --tombola --audio native  # force PulseAudio/pacat instead of Windows mpv.exe
+```
+
+It uses `play`'s `--size` / `--pos` split (default: a small strip along the
+top). In short panes it switches to a compact layout — planet and rings on the
+left, the page tabs, the settings that fit (always including the selected one)
+and key hints on the right; from 14 rows up you get the full layout with knobs.
+
+A physics sequencer in the spirit of the OP-1 Tombola, drawn like a planet with
+Saturn rings:
+
+- **Balls** fall under gravity inside a spinning polygon. Every edge is a pad
+  tuned to a step of the chosen scale; a ball that hits a pad hard enough plays
+  it — small balls an octave up, large balls an octave down, harder hits louder.
+- **Rings** circle the polygon as tilted ellipses (the far side passes behind
+  it). Each ring is one note of the current chord — the outer ring the bass —
+  and its moons play that note each time they pass the gate, the bright mark at
+  the front centre. Different orbit speeds turn the chord into a slow,
+  polyrhythmic arpeggio. Under it a sustained `PAD` plays the same chord,
+  moving through the chosen progression every `CHANGE` seconds.
+- **Grains**: `GRAIN` adds a granular cloud — 60–180 ms grains cut from the last
+  two seconds of notes, replayed at ½×, 1× and 2× pitch — shown as brief sparks.
+
+Everything is pure Python (no extra packages): instruments `PLUCK`
+(Karplus-Strong), `BELL` (FM), `MARIMBA`, `GLASS`, `PAD`, an attack/release
+envelope and a reverb. Mono 22.05 kHz PCM is streamed to Windows `mpv.exe` on
+WSL, or to `pacat` / Linux `mpv` natively. Graphics are 2×4-pixel blocks per
+cell (octant characters, which Windows Terminal draws pixel-exact) or braille
+dots (`v` toggles).
+
+Settings are split over two pages — `Tab` switches:
+
+| Page    | Settings |
+|---------|----------|
+| `BALLS` | `KEY` `SCALE` `INSTR` `ATTACK` `RELEASE` `SHAPE` `VISUAL` · knobs `BALLS` `GRAV` `ROT` `BOUNCE` `OCTAVE` `REVERB` `GRAIN` `VOL` |
+| `RINGS` | `KEY` `SCALE` `TONE` (moon instrument) `CHORD` (progression) `CHANGE` (seconds per chord) `RATIO` (orbit speeds: `KEPLER` outer-slower, `HARM`, `PRIME`, `GOLD`, `SYNC`) `VISUAL` · knobs `RINGS` (0–4) `MOONS` (per ring) `SPEED` `TILT` `PAD` `PING` (moon volume) `REVERB` `GRAIN` `VOL` |
+
+| Key            | Action                                    |
+|----------------|-------------------------------------------|
+| `Tab`          | switch page: BALLS / RINGS                |
+| `←` / `→`      | select setting (also `h` / `l`)           |
+| `↑` / `↓`      | change it (also `k` / `j`)                |
+| `3` … `8`      | shape: triangle, square, pentagon … octagon |
+| `s` / `S`      | next / previous shape                     |
+| `n` / `N`      | next / previous key                       |
+| `c` / `C`      | next / previous scale                     |
+| `i` / `I`      | next / previous instrument                |
+| `v`            | visual: blocks / braille                  |
+| `Space`        | on / off (freezes everything, mutes the pad) |
+| `r`            | random: new random settings + fresh balls (keeps VOL and VISUAL) |
+| `q`            | quit                                      |
+
+Settings are saved to `~/.config/play-tombola.json` after every change and come
+back the next time you open it, so a sound you like is still there — even if
+the pane was closed without `q`. The code lives in
+`tombola/` (physics, rings, synth, audio output, UI, params). Tests:
+`python3 test/test_tombola.py` and `test/e2e-tombola.sh`.
+
 ## Configuration
 
 Settings live in `~/.config/play.conf` and are rewritten whenever you launch or
