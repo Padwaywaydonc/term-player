@@ -50,7 +50,7 @@ SCREEN=$(T capture-pane -p -t t:0.0)
 for label in TOMBOLA BALLS RINGS "tab page"; do
     grep -q "$label" <<<"$SCREEN" || fail "small pane is missing '$label'"
 done
-LC_ALL=C.UTF-8 grep -qP '[\x{1CD00}-\x{1CDE5}]' <<<"$SCREEN" || fail "no canvas drawn in the small pane"
+grep -q '[▀▄█]' <<<"$SCREEN" || fail "no canvas drawn in the small pane"
 # The selected setting must be on screen even when the panel can't show them all.
 T send-keys -t t:0.0 Right                  # BALLS -> GRAV
 sleep 0.5

@@ -9,6 +9,7 @@ from synth import INSTRUMENTS
 from ui import VISUALS
 
 CONFIG = os.path.expanduser("~/.config/play-tombola.json")
+CONFIG_VERSION = 2
 PROGRESSIONS = {                 # scale degrees per chord
     "I-VI-IV-V": (0, 5, 3, 4),
     "I-IV-V-I": (0, 3, 4, 0),
@@ -21,10 +22,10 @@ PAGES = {
     "BALLS": (("key", "scale", "instr", "attack", "release", "shape", "visual"),
               ("balls", "grav", "rot", "bounce", "octave", "reverb", "grain", "vol")),
     "RINGS": (("key", "scale", "tone", "chord", "change", "ratio", "visual"),
-              ("rings", "moons", "speed", "tilt", "bed", "ping", "reverb", "grain", "vol")),
+              ("rings", "moons", "speed", "tilt", "bed", "ping", "reverb", "grain", "rvol")),
 }
 # r = respawn with fresh random settings, kept in ranges that stay musical.
-# VOL and VISUAL are left alone so a reroll never blasts or changes the look.
+# Both VOLs and VISUAL are left alone so a reroll never blasts or changes the look.
 RANDOM_RANGES = {
     "key": None, "scale": None, "instr": None, "shape": None,
     "attack": (1, 20), "release": (0.8, 3.0), "balls": (2, 6), "grav": (10, 60),
@@ -71,7 +72,7 @@ def make_params():
         _p("attack", "ATTACK", (1, 2, 5, 10, 20, 50, 100, 200, 500), 2, "{}MS"),
         _p("release", "RELEASE", [round(0.2 * i, 1) for i in range(1, 21)], 1.6, "{:.1f} S"),
         _p("shape", "SHAPE", SHAPES, "HEX"),
-        _p("visual", "VISUAL", VISUALS, "BLOCK"),
+        _p("visual", "VISUAL", VISUALS, "PIXEL"),
         _p("balls", "BALLS", range(1, 9), 4),
         _p("grav", "GRAV", range(0, 101, 5), 30),
         _p("rot", "ROT", range(-100, 101, 4), 20, "{:+d}"),
@@ -79,7 +80,8 @@ def make_params():
         _p("octave", "OCTAVE", range(-2, 3), 0, "{:+d}"),
         _p("reverb", "REVERB", range(0, 101, 5), 40, "{}%"),
         _p("grain", "GRAIN", range(0, 101, 5), 25, "{}%"),
-        _p("vol", "VOL", range(0, 101, 5), 70, "{}%"),
+        _p("vol", "VOL", range(0, 101, 5), 70, "{}%"),          # balls
+        _p("rvol", "VOL", range(0, 101, 5), 70, "{}%"),         # rings: moons + pad
         _p("tone", "TONE", INSTRUMENTS, "BELL"),
         _p("chord", "CHORD", PROGRESSIONS, "I-VI-IV-V"),
         _p("change", "CHANGE", (2, 3, 4, 6, 8, 12, 16), 6, "{} S"),
@@ -108,6 +110,8 @@ def load_params(path=CONFIG):
     except (OSError, ValueError):
         return params
     if isinstance(saved, dict):
+        if saved.get("version") != CONFIG_VERSION:
+            saved.pop("visual", None)          # v1 defaulted to BLOCK glyphs; start on PIXEL instead
         for p in params:
             if saved.get(p.key) in p.values:   # external input: ignore anything unknown
                 p.index = p.values.index(saved[p.key])
@@ -119,5 +123,5 @@ def save_params(params, path=CONFIG):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = f"{path}.tmp"
     with open(tmp, "w") as f:
-        json.dump({p.key: p.value for p in params}, f)
+        json.dump({"version": CONFIG_VERSION, **{p.key: p.value for p in params}}, f)
     os.replace(tmp, path)

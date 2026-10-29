@@ -54,7 +54,7 @@ SCREEN=$(tmux capture-pane -p -t "$SESS")
 for label in TOMBOLA HITS RINGS KEY SCALE INSTR ATTACK RELEASE SHAPE VISUAL BALLS GRAV ROT BOUNCE OCTAVE REVERB GRAIN VOL; do
     grep -q "$label" <<<"$SCREEN" || fail "screen is missing label $label"
 done
-LC_ALL=C.UTF-8 grep -qP '[\x{1CD00}-\x{1CDE5}]' <<<"$SCREEN" || fail "no octant canvas on screen"
+grep -q '[▀▄█]' <<<"$SCREEN" || fail "no pixel canvas on screen"
 
 # Select GRAV (right of BALLS) and raise it twice: 30 -> 40; hotkeys: triangle, next scale.
 tmux send-keys -t "$SESS" Right Up Up 3 c

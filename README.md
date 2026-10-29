@@ -116,16 +116,20 @@ Saturn rings:
 Everything is pure Python (no extra packages): instruments `PLUCK`
 (Karplus-Strong), `BELL` (FM), `MARIMBA`, `GLASS`, `PAD`, an attack/release
 envelope and a reverb. Mono 22.05 kHz PCM is streamed to Windows `mpv.exe` on
-WSL, or to `pacat` / Linux `mpv` natively. Graphics are 2×4-pixel blocks per
-cell (octant characters, which Windows Terminal draws pixel-exact) or braille
-dots (`v` toggles).
+WSL, or to `pacat` / Linux `mpv` natively. Graphics default to `PIXEL`:
+half-block characters, two square pixels per cell with their own colour, which
+every terminal and font draws as solid blocks. `v` also offers `BEHIND` (the
+same scene, muted, filling the whole pane behind the text), `BLOCK` (octant
+characters, finer but they need a font/terminal that has them) and `BRAILLE`.
 
 Settings are split over two pages — `Tab` switches:
 
 | Page    | Settings |
 |---------|----------|
-| `BALLS` | `KEY` `SCALE` `INSTR` `ATTACK` `RELEASE` `SHAPE` `VISUAL` · knobs `BALLS` `GRAV` `ROT` `BOUNCE` `OCTAVE` `REVERB` `GRAIN` `VOL` |
-| `RINGS` | `KEY` `SCALE` `TONE` (moon instrument) `CHORD` (progression) `CHANGE` (seconds per chord) `RATIO` (orbit speeds: `KEPLER` outer-slower, `HARM`, `PRIME`, `GOLD`, `SYNC`) `VISUAL` · knobs `RINGS` (0–4) `MOONS` (per ring) `SPEED` `TILT` `PAD` `PING` (moon volume) `REVERB` `GRAIN` `VOL` |
+| `BALLS` | `KEY` `SCALE` `INSTR` `ATTACK` `RELEASE` `SHAPE` `VISUAL` `BALLS` `GRAV` `ROT` `BOUNCE` `OCTAVE` `REVERB` `GRAIN` `VOL` (ball volume) |
+| `RINGS` | `KEY` `SCALE` `TONE` (moon instrument) `CHORD` (progression) `CHANGE` (seconds per chord) `RATIO` (orbit speeds: `KEPLER` outer-slower, `HARM`, `PRIME`, `GOLD`, `SYNC`) `VISUAL` `RINGS` (0–4) `MOONS` (per ring) `SPEED` `TILT` `PAD` `PING` (moons vs pad mix) `REVERB` `GRAIN` `VOL` (ring volume: moons + pad) |
+
+In a full-size pane every setting of the page is a knob along the bottom.
 
 | Key            | Action                                    |
 |----------------|-------------------------------------------|

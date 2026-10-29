@@ -13,6 +13,7 @@ from array import array
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tombola"))
 
 import app  # noqa: E402
+import pixels  # noqa: E402
 import ui  # noqa: E402
 from music import SCALES, pad_note  # noqa: E402
 from physics import World  # noqa: E402
@@ -180,6 +181,74 @@ class RingsTest(unittest.TestCase):
             self.assertLessEqual(abs(y), ey + 1e-9)
 
 
+class PixelTest(unittest.TestCase):
+    def test_half_blocks_encode_top_and_bottom_pixels(self):
+        cv = pixels.PixelCanvas(4, 1)
+        cv.plot(0, 0, pixels.EDGE, 1.0)                       # top only
+        cv.plot(1, 1, pixels.BALL, 1.0)                       # bottom only
+        cv.plot(2, 0, pixels.EDGE, 1.0)
+        cv.plot(2, 1, pixels.BALL, 1.0)                       # both, different colours
+        row = cv.rows_text()[0]
+        edge, ball = pixels.LAYERS[pixels.EDGE][1][-1], pixels.LAYERS[pixels.BALL][1][-1]
+        self.assertIn(f"38;5;{edge}m▀", row)
+        self.assertIn(f"38;5;{ball}m▄", row)
+        self.assertIn(f"38;5;{edge};48;5;{ball}m▀", row)
+        self.assertTrue(row.replace("\x1b[0m", "").endswith(" "))   # empty cell stays blank
+
+    def test_lines_are_gapless_one_pixel_strokes(self):
+        cv = pixels.PixelCanvas(40, 20)
+        cv.line(2.3, 3.7, 37.6, 31.2, pixels.EDGE)
+        lit = {(i % cv.w, i // cv.w) for i, l in enumerate(cv.layer) if l == pixels.EDGE}
+        for y in range(4, 31):                                  # every row the line spans is hit
+            self.assertTrue(any(py == y for _, py in lit), y)
+        self.assertLess(len(lit), 2 * 36)                       # thin: not a smeared band
+
+    def test_ramps_stay_in_one_hue(self):
+        def rgb(c):
+            if c >= 232:
+                v = 8 + 10 * (c - 232)
+                return v, v, v
+            c -= 16
+            lv = (0, 95, 135, 175, 215, 255)
+            return lv[c // 36], lv[c // 6 % 6], lv[c % 6]
+        for layer, (_, ramp) in pixels.LAYERS.items():
+            for c in ramp:
+                r, g, b = rgb(c)
+                self.assertTrue(r >= g >= b, (layer, c))         # greys or warm: no olive/green/blue
+
+    def test_scene_fits_small_strip(self):
+        e = app.Engine(app.make_params())
+        e.params["rings"].index = 4
+        e.apply()
+        for cols, rows in ((22, 3), (26, 5), (60, 20)):
+            text = pixels.draw_scene(e.world, e.rings, cols, rows)
+            self.assertEqual(len(text), rows)
+            for line in text:
+                self.assertEqual(len(re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", line)), cols)
+
+
+class BehindTest(unittest.TestCase):
+    def test_put_words_keeps_text_and_leaves_gaps_open(self):
+        placed = []
+        text = f"{ui.fg(ui.DIM)}KEY{ui.RESET}{ui.SELECT} D# {ui.RESET}  {ui.fg(ui.DIM)}SCALE{ui.RESET}"
+        ui._put_words(lambda r, c, t: placed.append((c, t)), 2, 10, text)
+        visible = [(c, ui._ANSI.sub("", t)) for c, t in placed]
+        self.assertEqual(visible, [(10, "KEY D# "), (19, "SCALE")])    # 2-space gap not drawn
+        self.assertTrue(placed[1][1].startswith(ui.fg(ui.DIM)))         # colour carried into piece
+
+    def test_behind_draws_scene_under_text_with_muted_colours(self):
+        ps = app.make_params()
+        e = app.Engine(ps)
+        e.params["visual"].index = e.params["visual"].values.index("BEHIND")
+        frame = ui.render(app.ui_state(e, app.Menu(ps)), 120, 40)
+        self.assertIn("TOMBOLA", frame)
+        bright = {ramp[-1] for _, ramp in pixels.LAYERS.values()}
+        used = {int(c) for c in re.findall(r"38;5;(\d+)m[▀▄█]", frame)}
+        self.assertTrue(used)
+        self.assertTrue(used <= set(pixels.DIM.values()), used)          # only muted backdrop colours
+        self.assertFalse(used & bright - set(pixels.DIM.values()))
+
+
 class AppTest(unittest.TestCase):
     def test_ring_notes_outer_is_bass(self):
         e = app.Engine(app.make_params())
@@ -269,6 +338,19 @@ class AppTest(unittest.TestCase):
             app.save_params(ps, path)
             self.assertEqual(os.listdir(os.path.dirname(path)), ["cfg.json"])
 
+    def test_v1_config_moves_to_pixel_but_keeps_the_sound(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "cfg.json")
+            with open(path, "w") as f:
+                json.dump({"visual": "BLOCK", "grav": 15, "key": "E"}, f)   # no version: v1 file
+            loaded = {p.key: p.value for p in app.load_params(path)}
+            self.assertEqual((loaded["visual"], loaded["grav"], loaded["key"]), ("PIXEL", 15, "E"))
+            ps = app.load_params(path)
+            vis = next(p for p in ps if p.key == "visual")
+            vis.index = vis.values.index("BLOCK")                             # user picks BLOCK again
+            app.save_params(ps, path)
+            self.assertEqual(next(p for p in app.load_params(path) if p.key == "visual").value, "BLOCK")
+
     def test_param_nudge_clamps(self):
         p = next(p for p in app.make_params() if p.key == "octave")
         for _ in range(10):
@@ -286,7 +368,9 @@ class AppTest(unittest.TestCase):
         visual = e.params["visual"]
         octants = set(ui.OCTANT[1:]) - {"█"}
         page_labels = {"BALLS": ("GRAV", "BOUNCE", "SHAPE"), "RINGS": ("RINGS", "MOONS", "SPEED", "PAD", "PING")}
-        for mode, is_glyph in (("BLOCK", lambda c: c in octants),
+        for mode, is_glyph in (("PIXEL", lambda c: c in "▀▄█"),
+                               ("BEHIND", lambda c: c in "▀▄█"),
+                               ("BLOCK", lambda c: c in octants),
                                ("BRAILLE", lambda c: 0x2800 < ord(c) <= 0x28FF)):
             visual.index = visual.values.index(mode)
             for page in menu.pages:
@@ -294,8 +378,10 @@ class AppTest(unittest.TestCase):
                 for cols, rows in ((120, 40), (60, 16)):
                     frame = ui.render(app.ui_state(e, menu), cols, rows)
                     self.assertTrue(any(map(is_glyph, frame)), mode)
-                    for label in ("TOMBOLA", "HITS", "SCALE", "BALLS", "RINGS", *page_labels[page]):
+                    for label in ("TOMBOLA", "SCALE", "BALLS", "RINGS", *page_labels[page]):
                         self.assertIn(label, frame, (page, cols))
+                    if cols >= 100:
+                        self.assertIn("HITS", frame)
                     # every cursor-positioned segment must end inside the terminal
                     for col, text in re.findall(r"\x1b\[\d+;(\d+)H((?:(?!\x1b\[\d+;\d+H).)*)", frame):
                         visible = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text)
@@ -326,7 +412,7 @@ class AppTest(unittest.TestCase):
             e.randomize(rng)
             seen.add(tuple(e.v(k) for k in ("key", "scale", "instr", "shape")))
             self.assertEqual(e.v("vol"), 15)
-            self.assertEqual(e.v("visual"), "BLOCK")
+            self.assertEqual(e.v("visual"), "PIXEL")
             self.assertTrue(2 <= e.v("balls") <= 6 and 60 <= e.v("bounce") <= 96)
             self.assertEqual(len(e.world.balls), e.v("balls"))
             self.assertEqual(e.world.sides, app.SHAPES[e.v("shape")])

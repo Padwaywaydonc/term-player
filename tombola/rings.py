@@ -9,7 +9,7 @@ Units match physics.py: the polygon's circumradius is 1, y points up.
 """
 import math
 
-INNER, GAP, SQUASH = 1.35, 0.27, 0.30
+INNER, GAP, SQUASH = 1.35, 0.30, 0.36
 MAX_RINGS = 4
 RATIOS = {                       # orbit speed of each ring relative to the innermost
     "KEPLER": None,              # real orbits: omega ~ r^-1.5

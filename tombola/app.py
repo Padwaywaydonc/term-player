@@ -57,9 +57,15 @@ class Engine:
         r.speed = self.v("speed") / 100 * 2.5
         r.tilt = math.radians(self.v("tilt"))
         self.mixer.wet = self.v("reverb") / 100
-        self.mixer.volume = self.v("vol") / 100 * 1.2
+        self.mixer.volume = 1.0                  # balls and rings each have their own VOL
         self.mixer.grain = self.v("grain") / 100
-        self.mixer.bed = self.v("bed") / 100 * 0.45 if self.on else 0.0
+        self.mixer.bed = self.v("bed") / 100 * 0.45 * self.ring_vol() if self.on else 0.0
+
+    def ball_vol(self):
+        return self.v("vol") / 100 * 1.2
+
+    def ring_vol(self):
+        return self.v("rvol") / 100 * 1.2
 
     def set_on(self, on):
         self.on = on
@@ -142,13 +148,14 @@ class Engine:
     def step(self, dt):
         for hit in self.world.step(dt):
             buf = self.mixer.note(*self.note_args(hit.edge, hit.octave))
-            self.mixer.trigger(buf, 0.35 * min(1.0, 0.25 + hit.speed / 2.5))
+            self.mixer.trigger(buf, 0.35 * min(1.0, 0.25 + hit.speed / 2.5) * self.ball_vol())
             self.hits += 1
         pings = self.rings.step(dt)
         if pings and self.v("ping"):
             notes = self.ring_notes()
             for k in pings:
-                self.mixer.trigger(self.mixer.note(*self.ping_args(notes[k])), 0.3 * self.v("ping") / 100)
+                self.mixer.trigger(self.mixer.note(*self.ping_args(notes[k])),
+                                   0.3 * self.v("ping") / 100 * self.ring_vol())
 
 
 # Direct hotkeys: (param, step) cycles a param, (param, "=", index) jumps to a value.
@@ -286,6 +293,6 @@ def ui_state(engine, menu, output=None, fx=None):
     side, knobs = page_params(menu.params, menu.page)
     return {"side": side, "knobs": knobs, "selected": menu.selected(), "pages": menu.pages,
             "page": menu.page, "world": engine.world, "rings": engine.rings,
-            "bed_level": engine.mixer.bed / 0.45, "hits": engine.hits,
+            "bed_level": engine.v("bed") / 100, "hits": engine.hits,
             "dsp": output.dsp if output else 0.0, "on": engine.on,
             "error": output.error if output else "", "fx": fx}

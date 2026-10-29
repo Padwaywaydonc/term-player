@@ -9,6 +9,8 @@ import random
 import re
 import unicodedata
 
+import pixels
+
 ORANGE, AMBER, DIM, BALL, FLASH, INK = 208, 214, 244, 230, 229, 16
 RING = (94, 130, 166)      # ring tracks, dim -> bright; drawn under everything else
 SPARK = 223
@@ -16,7 +18,7 @@ MOON, GATE = 214, 222      # amber moons; the gate marks where they play
 FLASH_S = 0.12
 SPARK_S = 0.15
 _PRIO = {ORANGE: 2, FLASH: 3, SPARK: 1, GATE: 1, BALL: 4, MOON: 4}
-VISUALS = ("BLOCK", "BRAILLE")
+VISUALS = ("PIXEL", "BEHIND", "BLOCK", "BRAILLE")
 
 
 def _bit(dx, dy):
@@ -207,12 +209,35 @@ def _label(text, value, selected, width):
     return f"{fg(DIM)}{text:<{width}}{RESET}{v}"
 
 
-def _knob(label, value, selected):
+def _knob(label, value, selected, inner=6):
+    """Four lines: rounded box with the value, label underneath. Width = inner + 2."""
     edge = fg(AMBER if selected else ORANGE)
-    val = f"{SELECT}{value:^6}{RESET}" if selected else f"{fg(BALL)}{value:^6}{RESET}"
-    lab = f"{fg(AMBER if selected else DIM)}{label:^8}{RESET}"
-    return (f"{edge}╭──────╮{RESET}", f"{edge}│{RESET}{val}{edge}│{RESET}",
-            f"{edge}╰──────╯{RESET}", lab)
+    val = f"{SELECT}{value:^{inner}}{RESET}" if selected else f"{fg(BALL)}{value:^{inner}}{RESET}"
+    lab = f"{fg(AMBER if selected else DIM)}{label:^{inner + 2}}{RESET}"
+    bar = "─" * inner
+    return (f"{edge}╭{bar}╮{RESET}", f"{edge}│{RESET}{val}{edge}│{RESET}",
+            f"{edge}╰{bar}╯{RESET}", lab)
+
+
+def _knob_inner(p):
+    """Box width that fits the param's longest value and its label."""
+    return max(6, len(p.label) - 2, max(len(p.fmt.format(v)) for v in p.values) + 2)
+
+
+def _knob_rows(params, width):
+    """Split knobs into the fewest rows that fit width, balanced (15 -> 8 + 7, not 10 + 5)."""
+    for n in range(1, len(params) + 1):
+        per = -(-len(params) // n)
+        rows = [params[i:i + per] for i in range(0, len(params), per)]
+        if all(sum(_knob_inner(p) + 4 for p in row) <= width for row in rows):
+            return rows
+    return [[p] for p in params]
+
+
+def knob_layout_fits(state, cols, rows):
+    """True when the full layout (scene + every setting as a knob) has room."""
+    n = len(_knob_rows(state["side"] + state["knobs"], cols - 4))
+    return rows >= 3 + MIN_SCENE_ROWS + 4 * n + 1
 
 
 SHORT = {"ATTACK": "ATK", "RELEASE": "REL", "VISUAL": "VIS", "CHANGE": "CHG"}
@@ -244,7 +269,7 @@ def _row(params, sel, width):
             return "  ".join(_label(l, v, s, 0) for l, v, s in items)
 
 
-COMPACT_ROWS = 14            # below this the frame switches to the side-by-side layout
+MIN_SCENE_ROWS = 6           # below this (after the knob rows) the frame goes compact
 
 
 def _tabs(state):
@@ -274,31 +299,70 @@ def _flow(params, sel, width):
     return ["  ".join(_label(l, v, s, 0) for l, v, s in line) for line in lines], sel_line
 
 
+_TOKENS = re.compile(r"(\x1b\[[0-9;?]*[A-Za-z])|( {2,})|([^\x1b ]+| )")
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def _put_words(put, row, col, text):
+    """put() text in pieces split at runs of 2+ spaces, so the scene behind shows between words."""
+    sgr, seg, seg_col, x = "", "", col, col
+    for esc, gap, run in _TOKENS.findall(text):
+        if esc:
+            sgr = "" if esc == RESET else sgr + esc
+            seg += esc
+        elif gap:
+            if _ANSI.sub("", seg).strip():
+                put(row, seg_col, seg + RESET)
+            x += len(gap)
+            seg, seg_col = sgr, x
+        else:
+            seg += run
+            x += len(run)
+    if _ANSI.sub("", seg).strip():
+        put(row, seg_col, seg + RESET)
+
+
+def _visual(state):
+    return next((p.value for p in state["side"] + state["knobs"] if p.key == "visual"), "PIXEL")
+
+
+def scene(state, cols, rows):
+    """Draw the world in the chosen visual: PIXEL (half blocks) or BLOCK/BRAILLE (2x4 glyphs)."""
+    if _visual(state) in ("PIXEL", "BEHIND"):
+        return pixels.draw_scene(state["world"], state["rings"], cols, rows, state.get("fx"),
+                                 state.get("bed_level", 0.0), flash_s=FLASH_S,
+                                 dim=_visual(state) == "BEHIND")
+    return draw_world(state["world"], state["rings"], cols, rows, _visual(state),
+                      state.get("fx"), state.get("bed_level", 0.0))
+
+
 def _render_compact(state, cols, rows, put):
     """Short panes (e.g. play's default 10% split): canvas left, controls right."""
     rings = state["rings"]
     ex, ey = rings.extent()
-    cw = max(8, min(int(2 * rows * ex / ey), cols * 45 // 100))   # canvas cols matching ring aspect
     side, knobs, sel = state["side"], state["knobs"], state["selected"]
-    visual = next((p.value for p in side + knobs if p.key == "visual"), "BLOCK")
-    for r, text in enumerate(draw_world(state["world"], rings, cw, rows, visual,
-                                        state.get("fx"), state.get("bed_level", 0.0))):
-        put(1 + r, 1, text)
+    if _visual(state) == "BEHIND":
+        cw = 0                                   # the scene is already behind the whole pane
+    else:
+        cw = max(8, min(int(2 * rows * ex / ey), cols * 45 // 100))   # canvas cols matching ring aspect
+        for r, text in enumerate(scene(state, cw, rows)):
+            put(1 + r, 1, text)
+    text_put = put
     x0 = cw + 3
     width = cols - x0
     hits = f"{fg(DIM)}HITS {RESET}{fg(BALL)}{state['hits'] % 10000:04d}{RESET}"
-    put(1, x0, f"\x1b[1m{fg(ORANGE)}TOMBOLA{RESET}  {_tabs(state)}")
+    text_put(1, x0, f"\x1b[1m{fg(ORANGE)}TOMBOLA{RESET}  {_tabs(state)}")
     title_w = 9 + sum(len(p) + 4 for p in state["pages"])
     if width - title_w >= 28:
-        put(1, cols - 25, f"{hits}  {_status(state)}")
+        text_put(1, cols - 25, f"{hits}  {_status(state)}")
     lines, at = _flow(side + knobs, sel, width)
     room = rows - (2 if rows >= 3 else 1)       # header, and the hint line when there is space
     start = min(max(0, at - room // 2), max(0, len(lines) - room))
     for i, line in enumerate(lines[start:start + room]):
-        put(2 + i, x0, line)
+        text_put(2 + i, x0, line)
     if rows >= 3:
         err = f" {fg(196)}{state['error']}{RESET}" if state["error"] else ""
-        put(rows, x0, _hints(width) + err)
+        text_put(rows, x0, _hints(width) + err)
 
 
 def render(state, cols, rows):
@@ -306,7 +370,13 @@ def render(state, cols, rows):
     side, knobs, sel = state["side"], state["knobs"], state["selected"]
     place = {}                                  # row -> [(col, text)]
     put = lambda r, c, t: place.setdefault(r, []).append((c, t))
-    if rows < COMPACT_ROWS:
+    behind = _visual(state) == "BEHIND"
+    if behind:
+        for r, text in enumerate(scene(state, cols, rows)):
+            put(1 + r, 1, text)
+        raw_put = put
+        put = lambda r, c, t: _put_words(raw_put, r, c, t)
+    if not knob_layout_fits(state, cols, rows):
         _render_compact(state, cols, rows, put)
         return _compose(place, rows)
 
@@ -314,28 +384,22 @@ def render(state, cols, rows):
     put(2, 3, f"{fg(DIM)}GENERATIVE SYNTH{RESET}")
     put(1, max(3, cols - 12), f"{fg(DIM)}HITS {RESET}{fg(BALL)}{state['hits'] % 10000:04d}{RESET}")
 
-    half = (len(side) + 1) // 2
-    for row, group in ((3, side[:half]), (4, side[half:])):
-        put(row, 3, _row(group, sel, cols - 4))
+    grid = _knob_rows(side + knobs, cols - 4)
+    top = 4
+    h = rows - top - 4 * len(grid) - 1
+    if not behind:
+        for r, text in enumerate(scene(state, cols - 4, h)):
+            put(top + r, 3, text)
 
-    big_knobs = rows >= 20 and cols >= len(knobs) * 9 + 4
-    bottom = (5 if big_knobs else 3) + 1
-    top = 6
-    h = max(4, rows - top - bottom)
-    visual = next((p.value for p in side + knobs if p.key == "visual"), "BLOCK")
-    for r, text in enumerate(draw_world(state["world"], state["rings"], cols - 4, h, visual,
-                                        state.get("fx"), state.get("bed_level", 0.0))):
-        put(top + r, 3, text)
-
-    if big_knobs:
-        step = (cols - 4) // len(knobs)
-        for i, p in enumerate(knobs):
-            for dy, part in enumerate(_knob(p.label, p.text(), p is sel)):
-                put(rows - 5 + dy, 3 + i * step + (step - 8) // 2, part)
-    else:
-        half = (len(knobs) + 1) // 2
-        for row, group in ((rows - 3, knobs[:half]), (rows - 2, knobs[half:])):
-            put(row, 3, _row(group, sel, cols - 4))
+    for gi, row in enumerate(grid):                 # knob rows sit above the hint line
+        y = rows - 4 * (len(grid) - gi)
+        widths = [_knob_inner(p) + 2 for p in row]
+        gap = (cols - 4 - sum(widths)) / len(row)  # spare room shared out evenly
+        x = 3 + gap / 2
+        for p, w in zip(row, widths):
+            for dy, part in enumerate(_knob(p.label, p.text(), p is sel, w - 2)):
+                put(y + dy, round(x), part)
+            x += w + gap
 
     err = f" {fg(196)}{state['error']}{RESET}" if state["error"] else ""
     put(rows, 3, _hints(cols - 24) + err)
