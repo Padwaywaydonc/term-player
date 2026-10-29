@@ -12,19 +12,20 @@ import time
 import tty
 
 from music import SHAPES, pad_note
-from params import (CONFIG, PAGES, PROGRESSIONS, RANDOM_RANGES, load_params, make_params,  # noqa: F401
-                    page_params, save_params)
+from params import (CONFIG, DEGREES, HISTORY_MAX, PAGES, PROGRESSIONS, RANDOM_RANGES,  # noqa: F401
+                    apply_snapshot, load_history, load_params, make_params, page_params, save_params,
+                    snapshot)
 from physics import BALL_SIZES, World
 from backdrop import Backdrop, scene_commands
 from rings import Rings
-from synth import Mixer, render_chord
+from synth import Mixer
 import ui
 
 PHYS_DT = 1 / 120
 FRAME_DT = 1 / 30
-BED_FADE_S = 1.5
-PING_ATTACK_MS = 5
-PREWARM_KEYS = {"key", "scale", "instr", "attack", "release", "octave", "shape", "tone", "chord", "rings"}
+PAD_LOWEST = 40                  # E2 (~82 Hz): the pad's bass never goes below this
+PREWARM_KEYS = {"key", "scale", "instr", "attack", "release", "octave", "shape"}
+RING_ORDER = (1, 3, 2, 0)        # chord tones added as RINGS grows: root, +fifth, +third, +bass
 
 
 class Engine:
@@ -37,8 +38,9 @@ class Engine:
         self.mixer = mixer or Mixer()
         self.hits = 0
         self.on = True
+        self.history = []                        # settings before each r, newest last
         self.chord_step = 0
-        self._bed_thread = None
+        self.chord_timer = 0.0
         self._warm_jobs = []
         self._warm_wake = threading.Event()
         self._warm_thread = None
@@ -59,8 +61,14 @@ class Engine:
         r.tilt = math.radians(self.v("tilt"))
         self.mixer.wet = self.v("reverb") / 100
         self.mixer.volume = 1.0                  # balls and rings each have their own VOL
-        self.mixer.grain = self.v("grain") / 100
+        c = self.mixer.cloud
+        c.level, c.density = self.v("grain") / 100, self.v("density") / 100
+        c.size, c.position, c.pitch = self.v("size") / 1000, self.v("position") / 100, self.v("pitch")
+        c.spread, c.texture, c.feedback = self.v("spread") / 100, self.v("texture") / 100, self.v("feedback") / 100
+        c.freeze = self.v("freeze") == "ON"
+        self.mixer.grain_source = self.v("source")
         self.mixer.bed = self.v("bed") / 100 * 0.45 * self.ring_vol() if self.on else 0.0
+        self.mixer.ring_timbre = self.v("tone")
 
     def ball_vol(self):
         return self.v("vol") / 100 * 1.2
@@ -73,45 +81,42 @@ class Engine:
         self.apply()
 
     def chord(self, step):
-        """Chord for a progression step: bass note + scale triad, below the balls."""
-        prog = PROGRESSIONS[self.v("chord")]
-        degree = prog[step % len(prog)]
-        k, sc, octv = self.v("key"), self.v("scale"), self.v("octave")
-        return [pad_note(k, sc, degree, octv - 2)] + [pad_note(k, sc, degree + i, octv - 1) for i in (0, 2, 4)]
+        """[bass, root, third, fifth] of the current chord.
+
+        CHORD is either a held scale degree (I..VII) or a progression, which
+        moves every CHANGE seconds (step counts those moves).
+
+        0 on the rings' OCTAVE is the lowest voicing whose bass is at least
+        PAD_LOWEST (clearly audible on any speaker); each step moves the whole
+        chord, pad and moons alike, an octave — negative steps go into sub-bass.
+        Independent of the balls.
+        """
+        name = self.v("chord")
+        if name in DEGREES:
+            degree = DEGREES.index(name)
+        else:
+            prog = PROGRESSIONS[name]
+            degree = prog[step % len(prog)]
+        k, sc = self.v("key"), self.v("scale")
+        notes = [pad_note(k, sc, degree, -1)] + [pad_note(k, sc, degree + i, 0) for i in (0, 2, 4)]
+        lift = 12 * max(0, -(-(PAD_LOWEST - notes[0]) // 12))
+        return [m + lift + 12 * self.v("roct") for m in notes]
 
     def ring_notes(self):
-        """Note each ring's moons play, innermost first: outer rings take the low chord tones."""
-        n = self.rings.count
-        chord = sorted(self.chord(self.chord_step))[:n]
-        return [m + 12 for m in reversed(chord)]
+        """Each ring's note, innermost first: RINGS picks how many chord tones sound
+        (root, +fifth, +third, +bass) and the outer rings take the lowest."""
+        chord = self.chord(self.chord_step)
+        notes = sorted(chord[i] for i in RING_ORDER[:self.rings.count])
+        return list(reversed(notes))
 
-    def ping_args(self, midi):
-        return midi, self.v("tone"), PING_ATTACK_MS, self.v("release")
-
-    def start_bed(self):
-        """Background worker: advance the chord every CHANGE seconds, crossfading the pad."""
-        if self._bed_thread is None:
-            self._bed_thread = threading.Thread(target=self._bed_loop, daemon=True)
-            self._bed_thread.start()
-
-    def _bed_loop(self):
-        while True:
-            change = self.v("change")
-            if self.on and self.v("bed") > 0:
-                notes = self.chord(self.chord_step)
-                fade = min(BED_FADE_S, change / 2)
-                self.mixer.trigger_bed(render_chord(notes, change + fade, fade))
-            for job in map(self.ping_args, self.ring_notes()):
-                self.mixer.note(*job)           # pre-render this chord's moon notes
-            start = time.monotonic()
-            while time.monotonic() - start < change:   # short naps: a new CHANGE applies quickly
-                time.sleep(0.1)
-                change = self.v("change")
-            if self.on:
-                self.chord_step += 1
+    def ring_targets(self):
+        """(midi, gain) per ring: full with its moon at the ring's highest point, FLOOR at its lowest."""
+        floor = self.v("floor") / 100
+        return [(m, floor + (1 - floor) * self.rings.level(k)) for k, m in enumerate(self.ring_notes())]
 
     def randomize(self, rng=random):
-        """New random settings (within RANDOM_RANGES) and freshly dropped balls."""
+        """New random settings (within RANDOM_RANGES) and freshly dropped balls; u undoes it."""
+        self.history = (self.history + [snapshot(self.params.values())])[-HISTORY_MAX:]
         for key, bounds in RANDOM_RANGES.items():
             p = self.params[key]
             ok = [i for i, v in enumerate(p.values) if bounds is None or bounds[0] <= v <= bounds[1]]
@@ -119,6 +124,15 @@ class Engine:
         self.apply()
         self.world.respawn()
         self.prewarm()
+
+    def undo(self):
+        """Back to the settings before the last r. Returns False when there is nothing to undo."""
+        if not self.history:
+            return False
+        apply_snapshot(self.params.values(), self.history.pop())
+        self.apply()
+        self.prewarm()
+        return True
 
     def note_args(self, edge, ball_octave):
         midi = pad_note(self.v("key"), self.v("scale"), edge, self.v("octave"), ball_octave)
@@ -130,8 +144,7 @@ class Engine:
         One worker; a newer request supersedes the one in progress, so holding
         a key down costs one render pass, not a thread per key repeat.
         """
-        self._warm_jobs = ([self.note_args(e, o) for e in range(self.world.sides) for _, o in BALL_SIZES]
-                           + [self.ping_args(m) for m in self.ring_notes()])
+        self._warm_jobs = [self.note_args(e, o) for e in range(self.world.sides) for _, o in BALL_SIZES]
         self._warm_wake.set()
         if self._warm_thread is None:
             self._warm_thread = threading.Thread(target=self._warm_loop, daemon=True)
@@ -149,24 +162,28 @@ class Engine:
     def step(self, dt):
         for hit in self.world.step(dt):
             buf = self.mixer.note(*self.note_args(hit.edge, hit.octave))
-            self.mixer.trigger(buf, 0.35 * min(1.0, 0.25 + hit.speed / 2.5) * self.ball_vol())
+            self.mixer.trigger(buf, 0.4 * min(1.0, 0.08 + hit.speed / 2.0) * self.ball_vol())   # hard hits louder
             self.hits += 1
-        pings = self.rings.step(dt)
-        if pings and self.v("ping"):
-            notes = self.ring_notes()
-            for k in pings:
-                self.mixer.trigger(self.mixer.note(*self.ping_args(notes[k])),
-                                   0.3 * self.v("ping") / 100 * self.ring_vol())
+        self.rings.step(dt)
+        if self.v("chord") in PROGRESSIONS:
+            self.chord_timer += dt
+            if self.chord_timer >= self.v("change"):
+                self.chord_timer = 0.0
+                self.chord_step += 1
+        self.mixer.set_rings(self.ring_targets())
 
 
 # Direct hotkeys: (param, step) cycles a param, (param, "=", index) jumps to a value.
 KEYMAP = {b"\x1b[C": "right", b"\x1b[D": "left", b"\x1b[A": "up", b"\x1b[B": "down",
           b"l": "right", b"h": "left", b"k": "up", b"j": "down", b"\t": "page",
-          b" ": "toggle", b"r": "respawn", b"q": "quit", b"Q": "quit",
+          b" ": "toggle", b"r": "respawn", b"u": "undo", b"q": "quit", b"Q": "quit",
           b"s": ("shape", 1), b"S": ("shape", -1), b"n": ("key", 1), b"N": ("key", -1),
           b"c": ("scale", 1), b"C": ("scale", -1), b"i": ("instr", 1), b"I": ("instr", -1),
-          b"v": ("visual", 1), b"w": ("window", 1),
-          **{str(n).encode(): ("shape", "=", n - 3) for n in range(3, 9)}}
+          b"v": ("visual", 1), b"w": ("window", 1), b"f": ("freeze", 1),
+          **{str(n).encode(): ("digit", n) for n in range(1, 10)}}
+# Digit keys mean different things per page: shape (sides 3-8) or chord degree (I-VII).
+DIGITS = {"BALLS": ("shape", lambda n: n - 3 if 3 <= n <= 8 else None),
+          "RINGS": ("chord", lambda n: n - 1 if 1 <= n <= 7 else None)}
 
 
 def parse_keys(data):
@@ -180,6 +197,10 @@ def parse_keys(data):
         else:
             i += 1
     return keys
+
+
+# Hotkeys that mean "this page's version" of a setting: i on RINGS changes the moons.
+PAGE_ALIASES = {"RINGS": {"instr": "tone"}}
 
 
 class Menu:
@@ -216,8 +237,16 @@ def handle_key(k, engine, menu):
     changed = None
     if k == "quit":
         return False
+    if isinstance(k, tuple) and k[0] == "digit":
+        if menu.page not in DIGITS:
+            return True
+        key, index = DIGITS[menu.page]
+        if index(k[1]) is not None:
+            k = (key, "=", index(k[1]))
+        else:
+            return True
     if isinstance(k, tuple):                      # hotkey: change that setting directly
-        changed = engine.params[k[0]]
+        changed = engine.params[PAGE_ALIASES.get(menu.page, {}).get(k[0], k[0])]
         if k[1] == "=":
             changed.index = k[2]
         else:
@@ -234,6 +263,8 @@ def handle_key(k, engine, menu):
         engine.set_on(not engine.on)
     elif k == "respawn":
         engine.randomize()
+    elif k == "undo":
+        engine.undo()
     if changed:
         engine.apply()
         if changed.key in PREWARM_KEYS:
@@ -244,8 +275,8 @@ def handle_key(k, engine, menu):
 def run(output_factory, config=CONFIG):
     params = load_params(config)
     engine = Engine(params)
+    engine.history = load_history(config)
     engine.prewarm()
-    engine.start_bed()
     output = output_factory(engine.mixer)
     output.start()
     menu = Menu(params)
@@ -273,7 +304,7 @@ def run(output_factory, config=CONFIG):
             if select.select([fd], [], [], 0)[0]:
                 if not all(handle_key(k, engine, menu) for k in parse_keys(os.read(fd, 64))):
                     return
-                save_params(params, config)     # every change sticks, even if the pane is killed
+                save_params(params, config, engine.history)   # every change sticks, even if killed
             while acc >= PHYS_DT:
                 if engine.on:
                     engine.step(PHYS_DT)
@@ -290,7 +321,7 @@ def run(output_factory, config=CONFIG):
         out.flush()
         window.stop()
         output.stop()
-        save_params(params, config)
+        save_params(params, config, engine.history)
 
 
 def sync_window(window, engine, fx):

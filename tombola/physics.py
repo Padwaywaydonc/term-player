@@ -109,13 +109,14 @@ class World:
                         hits.append(Hit(i, k, -vn, b.octave))
                 b.x -= cx * (b.r - d)
                 b.y -= cy * (b.r - d)
+            if math.hypot(b.x, b.y) > 1.0:                 # tunnelled out: put it back
+                b.x, b.y, b.vx, b.vy = b.x * 0.5, b.y * 0.5, 0.0, 0.0
+        self._collide_balls()
+        for b in self.balls:                               # last: bounce > 100% must never run away
             sp = math.hypot(b.vx, b.vy)
             if sp > MAX_SPEED:
                 b.vx *= MAX_SPEED / sp
                 b.vy *= MAX_SPEED / sp
-            if math.hypot(b.x, b.y) > 1.0:                 # tunnelled out: put it back
-                b.x, b.y, b.vx, b.vy = b.x * 0.5, b.y * 0.5, 0.0, 0.0
-        self._collide_balls()
 
     def _collide_balls(self):
         bs = self.balls

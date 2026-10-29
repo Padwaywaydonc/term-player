@@ -10,10 +10,9 @@ import math
 from rings import GAP, SQUASH
 
 # layer: (priority, ramp of xterm-256 colours from faint to full)
-RING, GATE, SPARK, EDGE, FLASH, MOON, BALL = range(7)
+RING, SPARK, EDGE, FLASH, MOON, BALL = range(6)
 LAYERS = {                     # every ramp stays in one hue: grey -> brown -> orange
     RING: (0, (237, 239, 94, 130)),
-    GATE: (1, (239, 136, 178, 222)),
     SPARK: (1, (240, 245, 223)),
     EDGE: (2, (94, 130, 166, 202, 208)),
     FLASH: (3, (136, 178, 220, 229)),
@@ -21,7 +20,7 @@ LAYERS = {                     # every ramp stays in one hue: grey -> brown -> o
     BALL: (5, (242, 247, 252, 230)),
 }
 # Backdrop palette (scene behind text): one muted colour per layer, same hues.
-DIM = {RING: 237, GATE: 94, SPARK: 239, EDGE: 94, FLASH: 136, MOON: 130, BALL: 243}
+DIM = {RING: 237, SPARK: 239, EDGE: 94, FLASH: 136, MOON: 130, BALL: 243}
 MIN_COVER = 0.08
 
 
@@ -126,14 +125,13 @@ def draw_scene(world, rings, cols, rows, fx=None, bed_level=0.0, flash_s=0.12, d
     for k in range(rings.count):
         if (rings.count - 1 - k) % stride:
             continue
-        lit = rings.time - rings.flash.get(k, -9) < flash_s
+        glow = ring_a * (0.45 + 0.55 * rings.level(k))     # louder ring, brighter track
         n = max(24, int(3 * math.pi * rings.radius(k) * scale))
         for i in range(n):
             a = 2 * math.pi * i / n
             x, y = rings.point(k, a)
             if not hidden(a, x, y):
-                cv.point(*to(x, y), RING, 1.0 if lit else ring_a)
-        cv.point(*to(*rings.point(k, 0.0)), GATE)
+                cv.point(*to(x, y), RING, glow)
 
     verts = [to(x, y) for x, y in world.vertices()]
     for k in range(len(verts)):
@@ -146,9 +144,9 @@ def draw_scene(world, rings, cols, rows, fx=None, bed_level=0.0, flash_s=0.12, d
     for b in world.balls:
         cv.disc(*to(b.x, b.y), b.r * scale, BALL)
     for k in range(rings.count):
-        lit = rings.time - rings.flash.get(k, -9) < flash_s
         for a in rings.moon_angles(k):
             x, y = rings.point(k, a)
             if not hidden(a, x, y):
-                cv.disc(*to(x, y), 0.04 * scale, BALL if lit and math.cos(a) > 0.9 else MOON)
+                ml = rings.moon_level(k, a)                          # moons swell as they climb
+                cv.disc(*to(x, y), (0.025 + 0.035 * ml) * scale, MOON)   # amber, never ball-white
     return cv.rows_text()

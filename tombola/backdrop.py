@@ -53,15 +53,17 @@ def scene_commands(world, rings, fx=None, bed_level=0.0, flash_s=0.12):
     """One frame of drawing commands, back to front."""
     ex, ey = rings.extent()
     out = [f"S {ex:.3f} {ey:.3f}"]
-    lit_ring = lambda k: rings.time - rings.flash.get(k, -9) < flash_s
-    ring_alpha = int(110 + 120 * min(1.0, bed_level))
+    pad = 0.5 + 0.5 * min(1.0, bed_level)
     runs = {k: _ring_runs(rings, k) for k in range(rings.count)}
 
     def rings_pass(front):
         for k, kruns in runs.items():
+            loud = rings.level(k)                           # louder ring, brighter and thicker track
             for f, pts in kruns:
                 if f == front and len(pts) > 1:
-                    out.append(_line(FLASH if lit_ring(k) else RING, 255 if lit_ring(k) else ring_alpha, 2, pts))
+                    if loud > 0.3:
+                        out.append(_line(RING, int(60 * loud * pad), 7, pts))
+                    out.append(_line(RING, int((90 + 165 * loud) * pad), 2, pts))
 
     rings_pass(False)                                       # far side, hidden by the planet below
     verts = world.vertices()
@@ -82,15 +84,13 @@ def scene_commands(world, rings, fx=None, bed_level=0.0, flash_s=0.12):
         out.append(_circle(BALL, 255, b.x, b.y, b.r))
     rings_pass(True)                                        # near side passes in front
     for k in range(rings.count):
-        gx, gy = rings.point(k, 0.0)
-        out.append(_circle(FLASH, 200, gx, gy, 0.012))
         for a in rings.moon_angles(k):
             x, y = rings.point(k, a)
             if not rings.in_front(a) and _inside(world, x, y):
                 continue
-            hot = lit_ring(k) and math.cos(a) > 0.9
-            out.append(_circle(BALL if hot else MOON, 50, x, y, 0.09 if hot else 0.06))
-            out.append(_circle(BALL if hot else MOON, 255, x, y, 0.04 if hot else 0.03))
+            ml = rings.moon_level(k, a)                        # moons swell as they rise; always amber,
+            out.append(_circle(MOON, int(30 + 70 * ml), x, y, 0.05 + 0.08 * ml))   # never ball-white
+            out.append(_circle(MOON, int(170 + 85 * ml), x, y, 0.022 + 0.026 * ml))
     out.append("E")
     return out
 

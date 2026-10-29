@@ -1,9 +1,10 @@
-"""Saturn-style rings around the tombola, with moons that play the chord.
+"""Saturn-style rings around the tombola: each ring is one note of the chord.
 
 Ring k (0 = innermost) is an ellipse around the polygon, tilted, seen from
 slightly above: its lower half passes in front of the polygon, its upper half
-behind it. Each moon on a ring plays that ring's chord note when it passes the
-gate, the front-centre point under the polygon.
+(the far side) behind it. Each ring sounds its chord note continuously; its
+moons are the volume envelope by height on screen — loud at the ring's highest
+point, silent at its lowest — so TILT reshapes the swell along with the view.
 
 Units match physics.py: the polygon's circumradius is 1, y points up.
 """
@@ -30,7 +31,6 @@ class Rings:
         self.tilt = math.radians(12)
         self.phase = [0.7 * k for k in range(MAX_RINGS)]   # staggered so they don't all start together
         self.time = 0.0
-        self.flash = {}                # ring -> time of its last ping
 
     @staticmethod
     def radius(k):
@@ -45,20 +45,26 @@ class Rings:
         return [self.phase[k] + TAU * m / self.moons for m in range(self.moons)]
 
     def step(self, dt):
-        """Advance the orbits; returns the rings whose moons crossed the gate."""
         self.time += dt
-        pings = []
         for k in range(self.count):
-            before = [a // TAU for a in self.moon_angles(k)]
             self.phase[k] += self.omega(k) * dt
-            crossed = sum(a // TAU != b for a, b in zip(self.moon_angles(k), before))
-            if crossed:
-                self.flash[k] = self.time
-                pings.extend([k] * crossed)
-        return pings
+
+    def height(self, k):
+        """Half the on-screen height of ring k (its tilted ellipse)."""
+        rx = self.radius(k)
+        return math.hypot(rx * math.sin(self.tilt), rx * SQUASH * math.cos(self.tilt))
+
+    def moon_level(self, k, angle):
+        """Envelope of a moon on ring k: 1 at the ring's highest point on screen, 0 at its lowest."""
+        y = self.point(k, angle)[1]
+        return ((y / self.height(k) + 1) / 2) ** 3    # steep: the lower half of the orbit drops out
+
+    def level(self, k):
+        """Ring k's envelope: its loudest moon."""
+        return max(self.moon_level(k, a) for a in self.moon_angles(k))
 
     def point(self, k, angle):
-        """World position of angle on ring k; angle 0 is the gate (front centre)."""
+        """World position of angle on ring k; angle 0 is the front centre (bottom), pi the far side."""
         rx = self.radius(k)
         ex, ey = rx * math.sin(angle), -rx * SQUASH * math.cos(angle)
         c, s = math.cos(self.tilt), math.sin(self.tilt)
@@ -66,6 +72,7 @@ class Rings:
 
     @staticmethod
     def in_front(angle):
+        """Lower half passes in front of the polygon; the upper (far) half goes behind it."""
         return math.cos(angle) > 0
 
     def extent(self):

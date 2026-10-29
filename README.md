@@ -104,17 +104,30 @@ Saturn rings:
 - **Balls** fall under gravity inside a spinning polygon. Every edge is a pad
   tuned to a step of the chosen scale; a ball that hits a pad hard enough plays
   it — small balls an octave up, large balls an octave down, harder hits louder.
-- **Rings** circle the polygon as tilted ellipses (the far side passes behind
-  it). Each ring is one note of the current chord — the outer ring the bass —
-  and its moons play that note each time they pass the gate, the bright mark at
-  the front centre. Different orbit speeds turn the chord into a slow,
-  polyrhythmic arpeggio. Under it a sustained `PAD` plays the same chord,
-  moving through the chosen progression every `CHANGE` seconds.
-- **Grains**: `GRAIN` adds a granular cloud — 60–180 ms grains cut from the last
-  two seconds of notes, replayed at ½×, 1× and 2× pitch — shown as brief sparks.
+- **Rings** are the chord. They circle the polygon as tilted ellipses (the
+  near, lower half passes in front of it, the far half behind). Each ring sounds
+  one chord note continuously — `RINGS` sets how many: root, + fifth, + third,
+  + bass, with the outer ring the lowest. The moons are each note's volume
+  envelope by height: a moon swells its note as it rises to the highest point of
+  its ring and lets it fade toward the lowest — `TILT` moves those points, so it
+  reshapes the swell (`FLOOR` is the volume left at the lowest point: 0% silent,
+  100% a steady drone). Moons
+  grow and glow as they get louder. You choose the chord: `CHORD` holds a scale
+  degree (`I`…`VII`, also keys `1`–`7` on the RINGS page), or pick a
+  progression to let it move every `CHANGE` seconds.
+- **Grains** — a granular processor modelled on Mutable Instruments Clouds, on
+  its own `GRAINS` page. It records the balls, the rings or both (`SOURCE`) into a
+  2-second buffer and replays grains from it: `DENSITY` (negative = steady rate,
+  0 = none, positive = random), `SIZE` (20–500 ms), `POSITION` (how far back),
+  `PITCH` (±12 semitones), `SPREAD` (random position, length and in-key pitch
+  jumps), `TEXTURE` (grain window: square → triangle → smooth), `FEEDBACK` (grains
+  re-recorded, soft-limited so it can't run away), `FREEZE` (stop recording and
+  keep granulating the last two seconds; also `f`) and `GRAIN` (level). Each
+  grain shows as a brief spark.
 
 Everything is pure Python (no extra packages): instruments `PLUCK`
-(Karplus-Strong), `BELL` (FM), `MARIMBA`, `GLASS`, `PAD`, an attack/release
+(Karplus-Strong), `BELL` (FM), `MARIMBA`, `GLASS`, `PAD`, `KALIMBA`, `VIBES`,
+`ORGAN`, `CHIME`, `SAW`, an attack/release
 envelope and a reverb. Mono 22.05 kHz PCM is streamed to Windows `mpv.exe` on
 WSL, or to `pacat` / Linux `mpv` natively. Graphics default to `PIXEL`:
 half-block characters, two square pixels per cell with their own colour, which
@@ -130,29 +143,33 @@ the terminal, lower the profile's background opacity (Settings → your profile
 → Appearance → Background opacity, e.g. 60%, acrylic off). With `WINDOW` on, the
 small strip drops its own picture and shows just the controls.
 
-Settings are split over two pages — `Tab` switches:
+Settings are split over three pages — `Tab` switches:
 
 | Page    | Settings |
 |---------|----------|
 | `BALLS` | `KEY` `SCALE` `INSTR` `ATTACK` `RELEASE` `SHAPE` `VISUAL` `BALLS` `GRAV` `ROT` `BOUNCE` `OCTAVE` `REVERB` `GRAIN` `VOL` (ball volume) |
-| `RINGS` | `KEY` `SCALE` `TONE` (moon instrument) `CHORD` (progression) `CHANGE` (seconds per chord) `RATIO` (orbit speeds: `KEPLER` outer-slower, `HARM`, `PRIME`, `GOLD`, `SYNC`) `VISUAL` `RINGS` (0–4) `MOONS` (per ring) `SPEED` `TILT` `PAD` `PING` (moons vs pad mix) `REVERB` `GRAIN` `VOL` (ring volume: moons + pad) |
+| `GRAINS` | `KEY` `SCALE` `SOURCE` (`ALL` `BALLS` `RINGS`) `FREEZE` `VISUAL` `WINDOW` `GRAIN` (level) `DENSITY` `SIZE` `POSITION` `PITCH` `SPREAD` `TEXTURE` `FEEDBACK` `REVERB` |
+| `RINGS` | `KEY` `SCALE` `INSTR` (ring timbre: `WARM` `GLASS` `SINE` `ORGAN` `SAW`) `CHORD` (held degree `I`…`VII`, or a progression) `CHANGE` (seconds per chord, progressions only) `RATIO` (orbit speeds: `KEPLER` outer-slower, `HARM`, `PRIME`, `GOLD`, `SYNC`) `VISUAL` `WINDOW` `RINGS` (chord notes, 0–4) `MOONS` (swells per orbit) `SPEED` `TILT` `OCTAVE` (−3…+3; 0 = lowest clearly audible, below = sub-bass) `PAD` (ring level) `FLOOR` (volume with the moon at its lowest: 0% silent … 100% drone) `REVERB` `GRAIN` `VOL` (ring volume) |
 
 In a full-size pane every setting of the page is a knob along the bottom.
 
 | Key            | Action                                    |
 |----------------|-------------------------------------------|
-| `Tab`          | switch page: BALLS / RINGS                |
+| `Tab`          | switch page: BALLS / RINGS / GRAINS       |
 | `←` / `→`      | select setting (also `h` / `l`)           |
 | `↑` / `↓`      | change it (also `k` / `j`)                |
-| `3` … `8`      | shape: triangle, square, pentagon … octagon |
+| `3` … `8`      | BALLS page: shape — triangle, square, pentagon … octagon |
+| `1` … `7`      | RINGS page: hold chord I … VII            |
 | `s` / `S`      | next / previous shape                     |
 | `n` / `N`      | next / previous key                       |
 | `c` / `C`      | next / previous scale                     |
-| `i` / `I`      | next / previous instrument                |
+| `i` / `I`      | next / previous instrument (balls, or ring timbre on the RINGS page) |
 | `v`            | visual: pixel / behind / blocks / braille |
 | `w`            | live backdrop window behind Windows Terminal |
+| `f`            | freeze the grain buffer                   |
 | `Space`        | on / off (freezes everything, mutes the pad) |
 | `r`            | random: new random settings + fresh balls (keeps VOL and VISUAL) |
+| `u`            | undo the last `r` (remembers the last 20 rolls, across restarts) |
 | `q`            | quit                                      |
 
 Settings are saved to `~/.config/play-tombola.json` after every change and come

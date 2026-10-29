@@ -21,6 +21,9 @@ SOCK="playtombolasplit_$$"
 T() { env HOME="$WORK/home" PLAY_MPV_WIN="$WORK/bin/mpv.exe" tmux -L "$SOCK" -f /dev/null "$@"; }
 REAL_CFG="$HOME/.config/play-tombola.json"
 REAL_SUM=$(sha256sum "$REAL_CFG" 2>/dev/null)
+# A tombola the user is playing saves to the real config on every key, so the
+# "test didn't touch it" check is only meaningful when none is running.
+USER_TOMBOLA=$(pgrep -f '^python3 .*/tombola( |$)' | tr '\n' ' ')
 
 cleanup() {
     T kill-server 2>/dev/null
@@ -74,7 +77,11 @@ sleep 2
 [ "$(T list-panes -t t 2>/dev/null | wc -l)" -eq 1 ] || fail "tombola pane did not close on quit"
 grep -q '"grav"' "$WORK/home/.config/play-tombola.json" 2>/dev/null || fail "settings not saved on quit"
 
-[ "$(sha256sum "$REAL_CFG" 2>/dev/null)" = "$REAL_SUM" ] || fail "the real $REAL_CFG was modified by the test"
+if [ -n "$USER_TOMBOLA" ]; then
+    echo "note: real-config check skipped — your own tombola is running (pid $USER_TOMBOLA)"
+else
+    [ "$(sha256sum "$REAL_CFG" 2>/dev/null)" = "$REAL_SUM" ] || fail "the real $REAL_CFG was modified by the test"
+fi
 
 [ $FAIL -eq 0 ] && echo "PASS: tombola opens in play's small split and closes cleanly (top pane ${TOP_H} rows)"
 exit $FAIL

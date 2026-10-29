@@ -14,10 +14,10 @@ import pixels
 ORANGE, AMBER, DIM, BALL, FLASH, INK = 208, 214, 244, 230, 229, 16
 RING = (94, 130, 166)      # ring tracks, dim -> bright; drawn under everything else
 SPARK = 223
-MOON, GATE = 214, 222      # amber moons; the gate marks where they play
+MOON = 214                 # amber moons
 FLASH_S = 0.12
 SPARK_S = 0.15
-_PRIO = {ORANGE: 2, FLASH: 3, SPARK: 1, GATE: 1, BALL: 4, MOON: 4}
+_PRIO = {ORANGE: 2, FLASH: 3, SPARK: 1, BALL: 4, MOON: 4}
 VISUALS = ("PIXEL", "BEHIND", "BLOCK", "BRAILLE")
 
 
@@ -157,10 +157,9 @@ def draw_rings(cv, rings, world, to, scale, bed_level):
     """Static elliptical ring tracks; the far half hides behind the polygon. PAD sets brightness."""
     inside = _inside(world)
     hidden = lambda a, x, y: not rings.in_front(a) and inside(x, y)
-    base = 0 if bed_level < 0.34 else 1 if bed_level < 0.67 else 2
     for k in range(rings.count):
-        lit = rings.time - rings.flash.get(k, -9) < FLASH_S
-        level = 2 if lit else base
+        loud = rings.level(k) * (0.5 + 0.5 * min(1.0, bed_level))
+        level = 2 if loud > 0.6 else 1 if loud > 0.25 else 0
         n = max(16, int(2 * math.pi * rings.radius(k) * scale))
         for i in range(0, n, 3 - level):
             a = 2 * math.pi * i / n
@@ -168,16 +167,13 @@ def draw_rings(cv, rings, world, to, scale, bed_level):
             if not hidden(a, x, y):
                 px, py = to(x, y)
                 cv.dot(round(px), round(py), RING[level], under=True)
-        gx, gy = to(*rings.point(k, 0.0))
-        for dx in (-1, 0, 1):
-            cv.dot(round(gx) + dx, round(gy), GATE, under=True)
     for k in range(rings.count):
-        lit = rings.time - rings.flash.get(k, -9) < FLASH_S
         for a in rings.moon_angles(k):
             x, y = rings.point(k, a)
             if not hidden(a, x, y):
                 px, py = to(x, y)
-                cv.disc(px, py, 0.035 * scale, BALL if lit and math.cos(a) > 0.9 else MOON)
+                ml = rings.moon_level(k, a)
+                cv.disc(px, py, (0.025 + 0.03 * ml) * scale, MOON)
 
 
 def draw_world(world, rings, cols, rows, visual="BLOCK", fx=None, bed_level=0.0):
@@ -242,23 +238,27 @@ def knob_layout_fits(state, cols, rows):
 
 SHORT = {"ATTACK": "ATK", "RELEASE": "REL", "VISUAL": "VIS", "CHANGE": "CHG"}
 HINTS = (("tab", "page"), ("←→", "select"), ("↑↓", "change"), ("3-8 s", "shape"), ("n", "key"),
-         ("c", "scale"), ("i", "instr"), ("v", "visual"), ("w", "window"), ("space", "on/off"), ("r", "random"),
+         ("c", "scale"), ("i", "instr"), ("v", "visual"), ("w", "window"), ("space", "on/off"), ("r", "random"), ("u", "undo"),
          ("q", "quit"))
 
 
-def _hints(width):
-    """Key hints that fit in width columns; page/shape/key/scale keys win over the rest."""
-    order = (0, 3, 4, 5, 6, 11, 8, 1, 2, 9, 10, 7)
+def _hints(width, page="BALLS"):
+    """Key hints that fit in width columns; page/shape/key/scale keys win over the rest.
+
+    Digits mean shape on BALLS and chord degree on RINGS."""
+    swap = {"BALLS": None, "RINGS": ("1-7", "chord"), "GRAINS": ("f", "freeze")}[page]
+    hints = HINTS if swap is None else tuple(swap if h[1] == "shape" else h for h in HINTS)
+    order = (0, 3, 4, 5, 6, 12, 10, 11, 8, 1, 2, 9, 7)
     keep, used = set(), 0
     for i in order:
-        k, label = HINTS[i]
+        k, label = hints[i]
         w = len(k) + len(label) + 3
         if used + w > width:
             break
         keep.add(i)
         used += w
     return "  ".join(f"{fg(AMBER)}{k}{RESET} {fg(DIM)}{label}{RESET}"
-                     for i, (k, label) in enumerate(HINTS) if i in keep)
+                     for i, (k, label) in enumerate(hints) if i in keep)
 
 
 def _row(params, sel, width):
@@ -272,9 +272,20 @@ def _row(params, sel, width):
 MIN_SCENE_ROWS = 6           # below this (after the knob rows) the frame goes compact
 
 
-def _tabs(state):
+def _tabs(state, only_current=False):
+    pages = [state["page"]] if only_current else state["pages"]
     return "  ".join(f"{SELECT} {p} {RESET}" if p == state["page"] else f"{fg(DIM)} {p} {RESET}"
-                     for p in state["pages"])
+                     for p in pages)
+
+
+def _title(state, width):
+    """Title + page tabs that fit width: drop the title first, then the other tabs."""
+    tabs_w = sum(len(p) + 4 for p in state["pages"])
+    if 9 + tabs_w <= width:
+        return f"\x1b[1m{fg(ORANGE)}TOMBOLA{RESET}  {_tabs(state)}", 9 + tabs_w
+    if tabs_w <= width:
+        return _tabs(state), tabs_w
+    return _tabs(state, only_current=True), len(state["page"]) + 2
 
 
 def _status(state):
@@ -351,8 +362,8 @@ def _render_compact(state, cols, rows, put):
     x0 = cw + 3
     width = cols - x0
     hits = f"{fg(DIM)}HITS {RESET}{fg(BALL)}{state['hits'] % 10000:04d}{RESET}"
-    text_put(1, x0, f"\x1b[1m{fg(ORANGE)}TOMBOLA{RESET}  {_tabs(state)}")
-    title_w = 9 + sum(len(p) + 4 for p in state["pages"])
+    title, title_w = _title(state, width)
+    text_put(1, x0, title)
     if width - title_w >= 28:
         text_put(1, cols - 25, f"{hits}  {_status(state)}")
     lines, at = _flow(side + knobs, sel, width)
@@ -362,7 +373,7 @@ def _render_compact(state, cols, rows, put):
         text_put(2 + i, x0, line)
     if rows >= 3:
         err = f" {fg(196)}{state['error']}{RESET}" if state["error"] else ""
-        text_put(rows, x0, _hints(width) + err)
+        text_put(rows, x0, _hints(width, state["page"]) + err)
 
 
 def render(state, cols, rows):
@@ -402,7 +413,7 @@ def render(state, cols, rows):
             x += w + gap
 
     err = f" {fg(196)}{state['error']}{RESET}" if state["error"] else ""
-    put(rows, 3, _hints(cols - 24) + err)
+    put(rows, 3, _hints(cols - 24, state["page"]) + err)
     put(rows, max(3, cols - 18), _status(state))
     return _compose(place, rows)
 

@@ -67,7 +67,7 @@ grep -q 'MAJOR' <<<"$SCREEN2" || fail "hotkey c did not advance scale MINOR -> M
 tmux send-keys -t "$SESS" Tab Up
 sleep 0.5
 SCREEN3=$(tmux capture-pane -p -t "$SESS")
-for label in MOONS SPEED TILT PAD PING CHORD CHANGE RATIO TONE; do
+for label in MOONS SPEED TILT PAD FLOOR CHORD CHANGE RATIO INSTR; do
     grep -q "$label" <<<"$SCREEN3" || fail "RINGS page is missing label $label"
 done
 sleep 3

@@ -23,7 +23,7 @@ from music import SCALES, pad_note  # noqa: E402
 from physics import World  # noqa: E402
 from rings import Rings  # noqa: E402
 from music import KEYS  # noqa: E402
-from synth import BLOCK, INSTRUMENTS, SAMPLE_RATE, Mixer, render_chord, render_note  # noqa: E402
+from synth import BLOCK, INSTRUMENTS, RING_TIMBRES, SAMPLE_RATE, Mixer, render_note  # noqa: E402
 
 
 def max_overshoot(w):
@@ -47,6 +47,14 @@ class PhysicsTest(unittest.TestCase):
             for _ in range(10_000):
                 w.step(1 / 120)
                 self.assertLess(max_overshoot(w), 0.02, f"{sides} sides")
+
+    def test_super_elastic_bounce_stays_inside_and_capped(self):
+        w = World(6, 8)
+        w.spin, w.gravity, w.bounce = 1.0, 2.0, 1.5
+        for _ in range(6000):
+            w.step(1 / 120)
+            self.assertLess(max_overshoot(w), 0.02)
+            self.assertTrue(all(math.hypot(b.vx, b.vy) <= 6.0 + 1e-9 for b in w.balls))
 
     def test_resting_ball_does_not_retrigger(self):
         w = World(6, 1)
@@ -91,11 +99,13 @@ class MusicTest(unittest.TestCase):
 
 class SynthTest(unittest.TestCase):
     def test_instruments_are_audible_and_bounded(self):
+        self.assertGreaterEqual(len(INSTRUMENTS), 10)
         for ins in INSTRUMENTS:
-            buf = render_note(64, ins, 2, 0.6)
-            peak = max(map(abs, buf))
-            self.assertGreater(peak, 0.1, ins)
-            self.assertLessEqual(peak, 1.0, ins)
+            for midi in (40, 64, 96):                         # low, middle, very high (aliasing guard)
+                buf = render_note(midi, ins, 2, 0.6)
+                peak = max(map(abs, buf))
+                self.assertGreater(peak, 0.1, (ins, midi))
+                self.assertLessEqual(peak, 1.0, (ins, midi))
 
     def test_mixer_outputs_pcm_and_retires_voices(self):
         m = Mixer()
@@ -116,32 +126,106 @@ class SynthTest(unittest.TestCase):
         self.assertLessEqual(m.active(), 24)
 
 
-    def test_chord_fades_in_and_out(self):
-        c = render_chord([48, 52, 55], 2.0, 0.5)
-        self.assertEqual(len(c), 2 * SAMPLE_RATE)
-        self.assertLess(abs(c[0]), 1e-6)
-        self.assertLess(max(map(abs, c[-50:])), 0.01)
-        self.assertGreater(max(map(abs, c[SAMPLE_RATE - 500:SAMPLE_RATE + 500])), 0.2)
+    def test_ring_voice_ramps_in_and_glides_without_clicks(self):
+        m = Mixer()
+        m.wet, m.bed = 0.0, 0.6
+        m.set_rings([(57, 1.0)])
+        first = array("h", m.render())
+        self.assertLess(max(map(abs, first[:16])), 300)       # gain ramps up, no jump at the start
+        for _ in range(30):
+            pcm = array("h", m.render())
+        steady = max(abs(pcm[i + 1] - pcm[i]) for i in range(len(pcm) - 1))
+        m.set_rings([(64, 1.0)])                                # chord change: glide, not a click
+        jumps = []
+        for _ in range(8):
+            pcm = array("h", m.render())
+            jumps += [abs(pcm[i + 1] - pcm[i]) for i in range(len(pcm) - 1)]
+        for _ in range(30):
+            pcm = array("h", m.render())
+        steady_after = max(abs(pcm[i + 1] - pcm[i]) for i in range(len(pcm) - 1))
+        self.assertLessEqual(max(jumps), 1.2 * max(steady, steady_after))   # a click would spike far above
+
+    def _cloud_mixer(self, **kw):
+        m = Mixer()
+        m.wet, m.grain_source = 0.0, "BALLS"
+        for k, v in kw.items():
+            setattr(m.cloud, k, v)
+        return m
 
     def test_grains_follow_notes_and_do_not_self_sustain(self):
         random.seed(3)
-        m = Mixer()
-        m.grain, m.wet = 1.0, 0.0
+        m = self._cloud_mixer(level=1.0, density=0.8)
         for _ in range(40):
             m.render()
-        self.assertEqual(m.grains, [])                       # nothing played yet: no grains
+        self.assertEqual(m.cloud.count, 0)                   # nothing played yet: no grains
         m.trigger(m.note(60, "GLASS", 2, 0.4), 0.5)
         for _ in range(60):
             m.render()
-        self.assertTrue(m.grains or m.history)
+        self.assertGreater(m.cloud.count, 0)
         for _ in range(int(3 * SAMPLE_RATE / BLOCK)):        # notes over, history ages out
             pcm = m.render()
         self.assertEqual(max(map(abs, array("h", pcm))), 0)
 
-    def test_bed_level_scales_live_and_mutes(self):
+    def test_density_sign_steady_random_or_none(self):
+        for density, check in ((-0.5, lambda c: c in (39, 40)), (0.0, lambda c: c == 0), (0.5, lambda c: 25 <= c <= 55)):
+            random.seed(1)
+            m = self._cloud_mixer(level=1.0, density=density, size=0.05)
+            m.trigger(m.note(60, "ORGAN", 2, 4.0), 0.5)
+            for _ in range(int(2 * SAMPLE_RATE / BLOCK)):    # 2 s at 20 grains/s
+                m.render()
+            self.assertTrue(check(m.cloud.count), (density, m.cloud.count))
+
+    def test_freeze_keeps_granulating_after_the_source_stops(self):
+        random.seed(2)
+        m = self._cloud_mixer(level=1.0, density=0.6)
+        m.trigger(m.note(60, "GLASS", 2, 0.5), 0.5)
+        for _ in range(30):
+            m.render()
+        m.cloud.freeze = True
+        for _ in range(int(4 * SAMPLE_RATE / BLOCK)):        # long after the note ended
+            pcm = m.render()
+        self.assertGreater(max(map(abs, array("h", pcm))), 200)
+
+    def test_grains_are_clearly_audible(self):
+        random.seed(4)
+        m = self._cloud_mixer(level=0.4, density=0.3)         # the defaults
+        m.trigger(m.note(57, "ORGAN", 2, 4.0), 0.4)
+        src = grains = 0.0
+        for _ in range(int(2 * SAMPLE_RATE / BLOCK)):
+            before = m.cloud.count
+            out = [0.0] * BLOCK
+            from synth import _mix
+            _mix(m.voices, out)
+            g = m.cloud.process(out)
+            src += sum(x * x for x in out)
+            grains += sum(x * x for x in g)
+        self.assertGreater(math.sqrt(grains / src), 0.3)     # within ~10 dB of the dry notes
+
+    def test_texture_morphs_the_window(self):
+        from synth import grain_window
+        box, tri, hann = (grain_window(1000, t) for t in (0.0, 0.5, 1.0))
+        self.assertGreater(box[100], 0.99)                    # flat top, fast edges
+        self.assertAlmostEqual(tri[250], 0.5, places=2)
+        self.assertAlmostEqual(hann[250], 0.5, places=2)
+        self.assertLess(hann[100], tri[100])                 # hann is softer near the edges
+        self.assertLess(box[0], 0.01)
+
+    def test_feedback_cannot_run_away(self):
+        random.seed(5)
+        m = self._cloud_mixer(level=1.0, density=1.0, feedback=0.9, size=0.3)
+        m.trigger(m.note(60, "SAW", 2, 1.0), 0.8)
+        peak = 0
+        for _ in range(int(10 * SAMPLE_RATE / BLOCK)):
+            m.render()
+            peak = max(peak, max(map(abs, m.cloud._prev)))
+        self.assertLessEqual(max(map(abs, m.cloud.history)), 1.0)   # the recording stays bounded
+        self.assertLess(peak, 8.0)                                   # so the cloud can't explode
+
+    def test_pad_level_scales_ring_tones_and_mutes(self):
         m = Mixer()
         m.wet = 0.0
-        m.trigger_bed(render_chord([48, 52, 55], 2.0, 0.1))
+        m.cloud.level = 0.0                                  # rings only (grains would echo them)
+        m.set_rings([(45, 1.0), (52, 1.0), (57, 1.0)])
         m.bed = 0.5
         for _ in range(20):
             loud = max(map(abs, array("h", m.render())))
@@ -150,14 +234,53 @@ class SynthTest(unittest.TestCase):
         self.assertGreater(loud, 1000)
         self.assertEqual(quiet, 0)
 
+    def test_removed_rings_fade_out_and_are_dropped(self):
+        m = Mixer()
+        m.bed = 0.5
+        m.set_rings([(45, 1.0), (52, 1.0)])
+        for _ in range(20):
+            m.render()
+        m.set_rings([(45, 1.0)])
+        for _ in range(30):
+            m.render()
+        self.assertEqual(len(m.ring_voices), 1)
+
+    def test_ring_timbres_have_their_harmonics(self):
+        from synth import _harmonic_table, PAD_TABLE_SIZE
+        def harmonic(table, k):
+            return abs(sum(x * math.sin(2 * math.pi * k * i / PAD_TABLE_SIZE) for i, x in enumerate(table)))
+        warm = _harmonic_table("WARM", 99, RING_TIMBRES)
+        sine = _harmonic_table("SINE", 99, RING_TIMBRES)
+        self.assertGreater(harmonic(warm, 2), 0.3 * harmonic(warm, 1))
+        self.assertLess(harmonic(sine, 2), 0.01 * harmonic(sine, 1))
+        saw_high = _harmonic_table("SAW", 2, RING_TIMBRES)                # high note: only 2 harmonics
+        self.assertLess(harmonic(saw_high, 5), 0.01 * harmonic(saw_high, 1))
+
 
 class RingsTest(unittest.TestCase):
-    def test_moons_ping_once_per_orbit(self):
+    def test_moon_envelope_follows_height(self):
         r = Rings()
-        r.count, r.moons, r.ratio, r.speed = 1, 2, "SYNC", 2 * math.pi   # one orbit per second
-        r.phase[0] = 0.1
-        pings = sum(len(r.step(1 / 120)) for _ in range(120 * 3))
-        self.assertEqual(pings, 6)                          # 2 moons x 3 orbits
+        r.count = 1
+        ys = [(r.point(0, math.radians(d))[1], math.radians(d)) for d in range(360)]
+        top, bottom = max(ys)[1], min(ys)[1]
+        self.assertAlmostEqual(r.moon_level(0, top), 1.0, places=3)
+        self.assertAlmostEqual(r.moon_level(0, bottom), 0.0, places=3)
+        for (y1, a1), (y2, a2) in zip(ys, ys[1:]):           # higher on screen = louder
+            self.assertEqual(y1 < y2, r.moon_level(0, a1) < r.moon_level(0, a2))
+
+    def test_tilt_moves_the_loudest_point(self):
+        r = Rings()
+        r.tilt = 0.0
+        flat = max(range(360), key=lambda d: r.moon_level(0, math.radians(d)))
+        r.tilt = math.radians(30)
+        tilted = max(range(360), key=lambda d: r.moon_level(0, math.radians(d)))
+        self.assertEqual(flat, 180)                          # level ring: top centre
+        self.assertGreater(abs(tilted - 180), 30)            # tilted: peak slides round the ring
+        r.tilt = 0.0
+        r.count, r.moons = 1, 2                              # two moons opposite: one always high
+        for a in (0.0, 0.7, 2.0, 3.0):
+            r.phase[0] = a
+            self.assertGreaterEqual(r.level(0), 0.35)
 
     def test_kepler_outer_rings_are_slower(self):
         r = Rings()
@@ -166,14 +289,14 @@ class RingsTest(unittest.TestCase):
         r.ratio = "HARM"
         self.assertAlmostEqual(r.omega(1), r.omega(0) / 2)
 
-    def test_gate_is_front_centre_below_the_polygon(self):
+    def test_lower_half_in_front_upper_half_behind(self):
         r = Rings()
         r.tilt = 0.0
         x, y = r.point(0, 0.0)
         self.assertAlmostEqual(x, 0.0)
-        self.assertLess(y, 0)
-        self.assertTrue(r.in_front(0.0))
-        self.assertFalse(r.in_front(math.pi))
+        self.assertLess(y, 0)                                # bottom centre ...
+        self.assertTrue(r.in_front(0.0))                     # ... is the near side, in front of the planet
+        self.assertFalse(r.in_front(math.pi))                # the top is the far side, behind it
 
     def test_extent_covers_every_ring_point(self):
         r = Rings()
@@ -277,14 +400,16 @@ class BackdropTest(unittest.TestCase):
         e = self._engine()
         r = e.rings
         r.count, r.moons, r.tilt = 1, 1, 0.0
-        r.phase[0] = math.pi                                 # far side, right behind the planet
+        r.phase[0] = math.pi                                 # top: the far side, behind the planet
         moon = r.point(0, math.pi)
         cmds = backdrop.scene_commands(e.world, r)
         self.assertFalse(any(c.startswith("C") and f"{moon[0]:.3f} {moon[1]:.3f}" in c for c in cmds))
-        r.phase[0] = 0.0                                     # at the gate, in front
-        gate = r.point(0, 0.0)
+        r.phase[0] = 0.0                                     # bottom: in front, loudest — amber, not ball-white
+        top = r.point(0, 0.0)
         cmds = backdrop.scene_commands(e.world, r)
-        self.assertTrue(any(c.startswith("C 255 175 0") and f"{gate[0]:.3f} {gate[1]:.3f}" in c for c in cmds))
+        moon_cmds = [c for c in cmds if c.startswith("C") and f"{top[0]:.3f} {top[1]:.3f}" in c]
+        self.assertTrue(moon_cmds)
+        self.assertTrue(all(c.startswith("C 255 175 0") for c in moon_cmds))
 
     def test_sender_streams_newest_frame_only(self):
         with tempfile.TemporaryDirectory() as d:
@@ -316,21 +441,106 @@ class AppTest(unittest.TestCase):
             e.apply()
             notes = e.ring_notes()
             self.assertEqual(len(notes), n)
-            self.assertEqual(notes[-1], min(e.chord(0)) + 12)
+            self.assertEqual(notes[-1], min(notes))             # outer ring plays the lowest tone
             self.assertEqual(notes, sorted(notes, reverse=True))
 
-    def test_moon_pings_play_notes(self):
+    def test_pad_never_drops_below_audible_range(self):
         e = app.Engine(app.make_params())
-        e.params["balls"].index = 0
-        e.params["grav"].index = 0
+        for key in ("C", "F#", "B"):
+            for octv in (-2, -1, 0, 1, 2):
+                e.params["key"].index = e.params["key"].values.index(key)
+                e.params["octave"].index = e.params["octave"].values.index(octv)
+                e.params["roct"].index = e.params["roct"].values.index(0)
+                for step in range(4):
+                    notes = e.chord(step)
+                    self.assertGreaterEqual(min(notes), app.PAD_LOWEST, (key, octv, notes))
+                    self.assertLess(max(notes) - min(notes), 24)          # one compact voicing
+
+    def test_rings_octave_moves_pad_and_moons_not_the_balls(self):
+        e = app.Engine(app.make_params())
+        base, moons = e.chord(0), e.ring_notes()
+        e.params["roct"].index = e.params["roct"].values.index(2)
         e.apply()
-        e.world.balls[0].x = e.world.balls[0].y = e.world.balls[0].vx = e.world.balls[0].vy = 0.0
-        pings = 0
-        for _ in range(120 * 8):                            # default orbits: several gate passes in 8 s
+        self.assertEqual(e.chord(0), [m + 24 for m in base])
+        self.assertEqual(e.ring_notes(), [m + 24 for m in moons])
+        e.params["octave"].index = e.params["octave"].values.index(-2)     # balls' octave
+        self.assertEqual(e.chord(0), [m + 24 for m in base])
+        menu = app.Menu(list(e.params.values()))
+        menu.next_page()
+        self.assertIn("roct", [p.key for p in menu.items()])
+
+    def test_rings_octave_goes_down_too(self):
+        e = app.Engine(app.make_params())
+        base = e.chord(0)
+        e.params["roct"].index = e.params["roct"].values.index(-3)
+        self.assertEqual(e.chord(0), [m - 36 for m in base])
+        self.assertEqual(e.params["roct"].values, tuple(range(-3, 4)))
+
+    def test_harder_hits_are_louder(self):
+        from physics import Hit
+        e = app.Engine(app.make_params())
+        gains = []
+        e.mixer.trigger = lambda buf, g: gains.append(g)
+        e.world.step = lambda dt, s=iter((0.3, 3.0)): [Hit(0, 0, next(s), 0)]
+        e.step(1 / 120)
+        e.step(1 / 120)
+        self.assertGreater(gains[1], 3 * gains[0])
+
+    def test_ring_gains_follow_the_moons(self):
+        e = app.Engine(app.make_params())
+        e.params["floor"].index = e.params["floor"].values.index(0)
+        e.params["rings"].index = 1
+        e.params["moons"].index = 0
+        e.apply()
+        e.params["tilt"].index = 0                           # level ring: top = pi, bottom = 0
+        e.apply()
+        e.rings.phase[0] = math.pi                           # highest point: loud
+        e.step(1 / 120)
+        (_, loud), = e.mixer.ring_targets
+        e.rings.phase[0] = 0.0                               # lowest point: silent
+        e.step(1 / 120)
+        (_, quiet), = e.mixer.ring_targets
+        self.assertGreater(loud, 0.95)
+        self.assertLess(quiet, 0.05)
+        e.params["floor"].index = e.params["floor"].values.index(100)      # FLOOR 100: steady drone
+        e.step(1 / 120)
+        self.assertEqual(e.mixer.ring_targets[0][1], 1.0)
+
+    def test_rings_count_picks_chord_tones(self):
+        e = app.Engine(app.make_params())
+        bass, root, third, fifth = e.chord(0)
+        expect = {1: [root], 2: [fifth, root], 3: [fifth, third, root], 4: [fifth, third, root, bass]}
+        for n, notes in expect.items():
+            e.params["rings"].index = e.params["rings"].values.index(n)
+            e.apply()
+            self.assertEqual(e.ring_notes(), notes)
+
+    def test_held_chord_stays_progression_moves(self):
+        e = app.Engine(app.make_params())
+        self.assertEqual(e.v("chord"), "I")
+        first = e.chord(0)
+        for _ in range(120 * 20):
             e.step(1 / 120)
-            pings += len(e.rings.flash)
-        self.assertEqual(e.hits, 0)                         # the ball floats; only moons play
-        self.assertGreater(e.mixer.active(), 0)
+        self.assertEqual(e.chord(e.chord_step), first)       # held: never moves by itself
+        e.params["chord"].index = e.params["chord"].values.index("I-IV-V-I")
+        e.params["change"].index = e.params["change"].values.index(2)
+        e.apply()
+        for _ in range(120 * 5):
+            e.step(1 / 120)
+        self.assertEqual(e.chord_step, 2)                    # moves every CHANGE seconds
+
+    def test_digits_pick_shape_on_balls_and_chord_on_rings(self):
+        ps = app.make_params()
+        e = app.Engine(ps)
+        menu = app.Menu(ps)
+        app.handle_key(("digit", 5), e, menu)
+        self.assertEqual(e.world.sides, 5)
+        menu.next_page()
+        app.handle_key(("digit", 5), e, menu)
+        self.assertEqual(e.v("chord"), "V")
+        self.assertEqual(e.world.sides, 5)                   # shape untouched on RINGS
+        app.handle_key(("digit", 9), e, menu)                # no 9th degree: ignored
+        self.assertEqual(e.v("chord"), "V")
 
     def test_tab_switches_pages_and_keeps_each_cursor(self):
         ps = app.make_params()
@@ -345,8 +555,63 @@ class AppTest(unittest.TestCase):
         app.handle_key("up", e, menu)
         self.assertEqual(e.rings.count, 4)
         app.handle_key("page", e, menu)
+        self.assertEqual(menu.page, "GRAINS")
+        app.handle_key("page", e, menu)                     # three pages, then back round
         self.assertIs(menu.selected(), balls_sel)
         self.assertEqual(app.parse_keys(b"\t"), ["page"])
+
+    def test_undo_brings_back_the_settings_before_r(self):
+        e = app.Engine(app.make_params())
+        before = app.snapshot(e.params.values())
+        rng = random.Random(9)
+        e.randomize(rng)
+        e.randomize(rng)
+        self.assertNotEqual(app.snapshot(e.params.values()), before)
+        self.assertTrue(e.undo())
+        self.assertTrue(e.undo())
+        self.assertEqual(app.snapshot(e.params.values()), before)
+        self.assertEqual(e.world.sides, app.SHAPES[before["shape"]])   # applied, not just stored
+        self.assertFalse(e.undo())                                       # nothing left: harmless
+        self.assertEqual(app.parse_keys(b"u"), ["undo"])
+
+    def test_history_persists_capped_and_validated(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "cfg.json")
+            e = app.Engine(app.make_params())
+            rng = random.Random(3)
+            for _ in range(25):
+                e.randomize(rng)
+            app.save_params(list(e.params.values()), path, e.history)
+            loaded = app.load_history(path)
+            self.assertEqual(len(loaded), app.HISTORY_MAX)
+            self.assertEqual(loaded, e.history)
+            with open(path) as f:
+                raw = json.load(f)
+            raw["history"] = ["junk", {"grav": 9999, "key": "C"}, 5]
+            with open(path, "w") as f:
+                json.dump(raw, f)
+            e2 = app.Engine(app.load_params(path))
+            e2.history = app.load_history(path)
+            self.assertEqual(len(e2.history), 1)
+            g = e2.v("grav")
+            e2.undo()
+            self.assertEqual((e2.v("key"), e2.v("grav")), ("C", g))          # bad value skipped
+
+    def test_instr_hotkey_follows_the_page(self):
+        ps = app.make_params()
+        e = app.Engine(ps)
+        menu = app.Menu(ps)
+        before_tone = e.v("tone")
+        app.handle_key(("instr", 1), e, menu)               # BALLS page: ball instrument
+        self.assertEqual(e.v("instr"), "BELL")
+        self.assertEqual(e.v("tone"), before_tone)
+        menu.next_page()
+        app.handle_key(("instr", 1), e, menu)               # RINGS page: ring timbre
+        self.assertEqual(e.v("tone"), "GLASS")
+        self.assertEqual(menu.selected().key, "tone")
+        self.assertEqual(e.v("instr"), "BELL")
+        ring_labels = [p.label for p in app.page_params(ps, "RINGS")[0]]
+        self.assertIn("INSTR", ring_labels)
 
     def test_hotkey_for_other_page_changes_value_without_moving_cursor(self):
         ps = app.make_params()
@@ -426,7 +691,8 @@ class AppTest(unittest.TestCase):
         menu = app.Menu(ps)
         visual = e.params["visual"]
         octants = set(ui.OCTANT[1:]) - {"█"}
-        page_labels = {"BALLS": ("GRAV", "BOUNCE", "SHAPE"), "RINGS": ("RINGS", "MOONS", "SPEED", "PAD", "PING")}
+        page_labels = {"BALLS": ("GRAV", "BOUNCE", "SHAPE"), "RINGS": ("RINGS", "MOONS", "SPEED", "PAD", "FLOOR"),
+                       "GRAINS": ("DENSITY", "SIZE", "POSITION", "TEXTURE", "FEEDBACK", "SOURCE")}
         for mode, is_glyph in (("PIXEL", lambda c: c in "▀▄█"),
                                ("BEHIND", lambda c: c in "▀▄█"),
                                ("BLOCK", lambda c: c in octants),
@@ -437,10 +703,11 @@ class AppTest(unittest.TestCase):
                 for cols, rows in ((120, 40), (60, 16)):
                     frame = ui.render(app.ui_state(e, menu), cols, rows)
                     self.assertTrue(any(map(is_glyph, frame)), mode)
-                    for label in ("TOMBOLA", "SCALE", "BALLS", "RINGS", *page_labels[page]):
+                    for label in ("SCALE", "BALLS", "RINGS", *page_labels[page]):
                         self.assertIn(label, frame, (page, cols))
-                    if cols >= 100:
+                    if cols >= 100:                            # narrow strips drop the title first
                         self.assertIn("HITS", frame)
+                        self.assertIn("TOMBOLA", frame)
                     # every cursor-positioned segment must end inside the terminal
                     for col, text in re.findall(r"\x1b\[\d+;(\d+)H((?:(?!\x1b\[\d+;\d+H).)*)", frame):
                         visible = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text)
@@ -472,7 +739,7 @@ class AppTest(unittest.TestCase):
             seen.add(tuple(e.v(k) for k in ("key", "scale", "instr", "shape")))
             self.assertEqual(e.v("vol"), 15)
             self.assertEqual(e.v("visual"), "PIXEL")
-            self.assertTrue(2 <= e.v("balls") <= 6 and 60 <= e.v("bounce") <= 96)
+            self.assertTrue(2 <= e.v("balls") <= 6 and 60 <= e.v("bounce") <= 110)
             self.assertEqual(len(e.world.balls), e.v("balls"))
             self.assertEqual(e.world.sides, app.SHAPES[e.v("shape")])
         self.assertGreater(len(seen), 15)
@@ -514,7 +781,7 @@ class AppTest(unittest.TestCase):
         xs = [i % cols for i in ring_cells]
         self.assertLess(min(xs), cols * 0.15)          # rings reach far past the polygon sideways
         self.assertGreater(max(xs), cols * 0.85)
-        # far side hidden: no ring pixels in the polygon's upper interior around the centre column
+        # far side (the upper half) hidden: no ring pixels in the polygon's upper interior, centre column
         top_inside = [i for i in ring_cells if abs(i % cols - cols / 2) < 2 and i // cols < cv.rows * 0.4]
         self.assertEqual(top_inside, [])
         e.params["rings"].index = 0
@@ -538,7 +805,7 @@ class AppTest(unittest.TestCase):
     def test_grain_sparks_are_capped_and_expire(self):
         m = Mixer()
         fx = ui.Effects(random.Random(1))
-        m.grain_count = 50
+        m.cloud.count = 50
         fx.update(m, 0.0)
         self.assertEqual(len(fx.sparks), ui.Effects.MAX_NEW_SPARKS)
         self.assertTrue(all(math.hypot(x, y) <= 0.75 for x, y, _ in fx.sparks))
@@ -549,7 +816,7 @@ class AppTest(unittest.TestCase):
 
     def test_hotkeys(self):
         self.assertEqual(app.parse_keys(b"3s8ncI"),
-                         [("shape", "=", 0), ("shape", 1), ("shape", "=", 5),
+                         [("digit", 3), ("shape", 1), ("digit", 8),
                           ("key", 1), ("scale", 1), ("instr", -1)])
         shapes = app.make_params()[5].values
         self.assertEqual(shapes[0], "TRI")
