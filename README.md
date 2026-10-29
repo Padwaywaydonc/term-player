@@ -122,6 +122,14 @@ every terminal and font draws as solid blocks. `v` also offers `BEHIND` (the
 same scene, muted, filling the whole pane behind the text), `BLOCK` (octant
 characters, finer but they need a font/terminal that has them) and `BRAILLE`.
 
+**Live backdrop behind the whole terminal (Windows Terminal on WSL):** press `w`
+(setting `WINDOW`). tombola opens a borderless window that follows your Windows
+Terminal window and sits right behind it, drawing the scene smoothly at full
+window resolution — every hit, flash and knob change, live. To see it through
+the terminal, lower the profile's background opacity (Settings → your profile
+→ Appearance → Background opacity, e.g. 60%, acrylic off). With `WINDOW` on, the
+small strip drops its own picture and shows just the controls.
+
 Settings are split over two pages — `Tab` switches:
 
 | Page    | Settings |
@@ -141,7 +149,8 @@ In a full-size pane every setting of the page is a knob along the bottom.
 | `n` / `N`      | next / previous key                       |
 | `c` / `C`      | next / previous scale                     |
 | `i` / `I`      | next / previous instrument                |
-| `v`            | visual: blocks / braille                  |
+| `v`            | visual: pixel / behind / blocks / braille |
+| `w`            | live backdrop window behind Windows Terminal |
 | `Space`        | on / off (freezes everything, mutes the pad) |
 | `r`            | random: new random settings + fresh balls (keeps VOL and VISUAL) |
 | `q`            | quit                                      |

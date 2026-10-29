@@ -19,9 +19,9 @@ PROGRESSIONS = {                 # scale degrees per chord
 }
 # Each page lists (side settings, knobs). Shared settings sit on both pages.
 PAGES = {
-    "BALLS": (("key", "scale", "instr", "attack", "release", "shape", "visual"),
+    "BALLS": (("key", "scale", "instr", "attack", "release", "shape", "visual", "window"),
               ("balls", "grav", "rot", "bounce", "octave", "reverb", "grain", "vol")),
-    "RINGS": (("key", "scale", "tone", "chord", "change", "ratio", "visual"),
+    "RINGS": (("key", "scale", "tone", "chord", "change", "ratio", "visual", "window"),
               ("rings", "moons", "speed", "tilt", "bed", "ping", "reverb", "grain", "rvol")),
 }
 # r = respawn with fresh random settings, kept in ranges that stay musical.
@@ -73,6 +73,7 @@ def make_params():
         _p("release", "RELEASE", [round(0.2 * i, 1) for i in range(1, 21)], 1.6, "{:.1f} S"),
         _p("shape", "SHAPE", SHAPES, "HEX"),
         _p("visual", "VISUAL", VISUALS, "PIXEL"),
+        _p("window", "WINDOW", ("OFF", "ON"), "OFF"),           # live scene behind Windows Terminal
         _p("balls", "BALLS", range(1, 9), 4),
         _p("grav", "GRAV", range(0, 101, 5), 30),
         _p("rot", "ROT", range(-100, 101, 4), 20, "{:+d}"),

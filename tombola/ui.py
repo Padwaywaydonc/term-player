@@ -242,13 +242,13 @@ def knob_layout_fits(state, cols, rows):
 
 SHORT = {"ATTACK": "ATK", "RELEASE": "REL", "VISUAL": "VIS", "CHANGE": "CHG"}
 HINTS = (("tab", "page"), ("←→", "select"), ("↑↓", "change"), ("3-8 s", "shape"), ("n", "key"),
-         ("c", "scale"), ("i", "instr"), ("v", "visual"), ("space", "on/off"), ("r", "random"),
+         ("c", "scale"), ("i", "instr"), ("v", "visual"), ("w", "window"), ("space", "on/off"), ("r", "random"),
          ("q", "quit"))
 
 
 def _hints(width):
     """Key hints that fit in width columns; page/shape/key/scale keys win over the rest."""
-    order = (0, 3, 4, 5, 6, 10, 1, 2, 8, 9, 7)
+    order = (0, 3, 4, 5, 6, 11, 8, 1, 2, 9, 10, 7)
     keep, used = set(), 0
     for i in order:
         k, label = HINTS[i]
@@ -341,8 +341,8 @@ def _render_compact(state, cols, rows, put):
     rings = state["rings"]
     ex, ey = rings.extent()
     side, knobs, sel = state["side"], state["knobs"], state["selected"]
-    if _visual(state) == "BEHIND":
-        cw = 0                                   # the scene is already behind the whole pane
+    if _visual(state) == "BEHIND" or state.get("window"):
+        cw = 0                                   # the scene is already behind the pane / the window
     else:
         cw = max(8, min(int(2 * rows * ex / ey), cols * 45 // 100))   # canvas cols matching ring aspect
         for r, text in enumerate(scene(state, cw, rows)):

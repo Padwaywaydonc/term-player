@@ -15,6 +15,7 @@ from music import SHAPES, pad_note
 from params import (CONFIG, PAGES, PROGRESSIONS, RANDOM_RANGES, load_params, make_params,  # noqa: F401
                     page_params, save_params)
 from physics import BALL_SIZES, World
+from backdrop import Backdrop, scene_commands
 from rings import Rings
 from synth import Mixer, render_chord
 import ui
@@ -164,7 +165,7 @@ KEYMAP = {b"\x1b[C": "right", b"\x1b[D": "left", b"\x1b[A": "up", b"\x1b[B": "do
           b" ": "toggle", b"r": "respawn", b"q": "quit", b"Q": "quit",
           b"s": ("shape", 1), b"S": ("shape", -1), b"n": ("key", 1), b"N": ("key", -1),
           b"c": ("scale", 1), b"C": ("scale", -1), b"i": ("instr", 1), b"I": ("instr", -1),
-          b"v": ("visual", 1),
+          b"v": ("visual", 1), b"w": ("window", 1),
           **{str(n).encode(): ("shape", "=", n - 3) for n in range(3, 9)}}
 
 
@@ -249,6 +250,7 @@ def run(output_factory, config=CONFIG):
     output.start()
     menu = Menu(params)
     fx = ui.Effects()
+    window = Backdrop()
 
     fd = sys.stdin.fileno()
     saved_tty = termios.tcgetattr(fd)
@@ -278,21 +280,35 @@ def run(output_factory, config=CONFIG):
                 acc -= PHYS_DT
             cols, rows = shutil.get_terminal_size()
             fx.update(engine.mixer, now)
-            out.write(ui.render(ui_state(engine, menu, output, fx), cols, rows))
+            sync_window(window, engine, fx)
+            out.write(ui.render(ui_state(engine, menu, output, fx, window), cols, rows))
             out.flush()
             time.sleep(max(0.0, FRAME_DT - (time.monotonic() - now)))
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved_tty)
         out.write("\x1b[0m\x1b[?25h\x1b[?1049l")
         out.flush()
+        window.stop()
         output.stop()
         save_params(params, config)
 
 
-def ui_state(engine, menu, output=None, fx=None):
+def sync_window(window, engine, fx):
+    """Keep the Windows backdrop in step with the WINDOW setting and feed it a frame."""
+    if engine.v("window") != "ON":
+        window.stop()
+        return
+    window.start()
+    if window.running:
+        window.submit(scene_commands(engine.world, engine.rings, fx, engine.v("bed") / 100, ui.FLASH_S))
+
+
+def ui_state(engine, menu, output=None, fx=None, window=None):
     side, knobs = page_params(menu.params, menu.page)
     return {"side": side, "knobs": knobs, "selected": menu.selected(), "pages": menu.pages,
             "page": menu.page, "world": engine.world, "rings": engine.rings,
             "bed_level": engine.v("bed") / 100, "hits": engine.hits,
             "dsp": output.dsp if output else 0.0, "on": engine.on,
-            "error": output.error if output else "", "fx": fx}
+            "error": " ".join(e for e in (output.error if output else "",
+                                          window.error if window else "") if e),
+            "fx": fx, "window": engine.v("window") == "ON"}

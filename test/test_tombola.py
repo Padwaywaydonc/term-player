@@ -3,6 +3,9 @@
 import json
 import math
 import re
+import subprocess
+import threading
+import time
 import os
 import random
 import sys
@@ -13,6 +16,7 @@ from array import array
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tombola"))
 
 import app  # noqa: E402
+import backdrop  # noqa: E402
 import pixels  # noqa: E402
 import ui  # noqa: E402
 from music import SCALES, pad_note  # noqa: E402
@@ -247,6 +251,61 @@ class BehindTest(unittest.TestCase):
         self.assertTrue(used)
         self.assertTrue(used <= set(pixels.DIM.values()), used)          # only muted backdrop colours
         self.assertFalse(used & bright - set(pixels.DIM.values()))
+
+
+class BackdropTest(unittest.TestCase):
+    def _engine(self):
+        e = app.Engine(app.make_params())
+        e.params["rings"].index = 4
+        e.apply()
+        return e
+
+    def test_frame_draws_back_to_front(self):
+        e = self._engine()
+        cmds = backdrop.scene_commands(e.world, e.rings)
+        self.assertTrue(cmds[0].startswith("S "))
+        self.assertEqual(cmds[-1], "E")
+        kinds = [c.split()[0] for c in cmds]
+        fill = kinds.index("F")                              # planet fill hides the far ring halves
+        self.assertIn("L", kinds[1:fill])                    # far ring halves before it
+        self.assertIn("L", kinds[fill + 1:])                 # edges / near halves after it
+        for c in cmds[1:-1]:
+            nums = c.split()[1:]
+            self.assertTrue(all(re.fullmatch(r"-?\d+(\.\d+)?", n) for n in nums), c)
+
+    def test_moons_behind_the_planet_are_not_drawn(self):
+        e = self._engine()
+        r = e.rings
+        r.count, r.moons, r.tilt = 1, 1, 0.0
+        r.phase[0] = math.pi                                 # far side, right behind the planet
+        moon = r.point(0, math.pi)
+        cmds = backdrop.scene_commands(e.world, r)
+        self.assertFalse(any(c.startswith("C") and f"{moon[0]:.3f} {moon[1]:.3f}" in c for c in cmds))
+        r.phase[0] = 0.0                                     # at the gate, in front
+        gate = r.point(0, 0.0)
+        cmds = backdrop.scene_commands(e.world, r)
+        self.assertTrue(any(c.startswith("C 255 175 0") and f"{gate[0]:.3f} {gate[1]:.3f}" in c for c in cmds))
+
+    def test_sender_streams_newest_frame_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "frames.txt")
+            w = backdrop.Backdrop()
+            w.proc = subprocess.Popen(["sh", "-c", f"cat > {out}"], stdin=subprocess.PIPE, text=True)
+            for n in range(5):                               # burst before the sender runs: only #4 survives
+                w.submit([f"S {n} 1", "E"])
+            w._thread = threading.Thread(target=w._send_loop, daemon=True)
+            w._thread.start()
+            time.sleep(0.3)
+            w.stop()
+            self.assertEqual(open(out).read(), "S 4 1\nE\n")
+            w.stop()                                         # idempotent
+
+    def test_window_off_never_starts_powershell(self):
+        e = self._engine()
+        w = backdrop.Backdrop()
+        w.start = lambda: self.fail("started with WINDOW OFF")
+        app.sync_window(w, e, None)
+        self.assertFalse(w.running)
 
 
 class AppTest(unittest.TestCase):
