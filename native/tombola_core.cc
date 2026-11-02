@@ -22,7 +22,13 @@
 
 #include "clouds/dsp/granular_processor.h"   // declares the frame types reverb.h needs
 #include "clouds/dsp/fx/reverb.h"
+#include "elements/dsp/part.h"
+#include "marbles/random/random_generator.h"
+#include "marbles/random/random_sequence.h"
+#include "marbles/random/random_stream.h"
+#include "plaits/dsp/voice.h"
 #include "rings/dsp/part.h"
+#include "stmlib/utils/buffer_allocator.h"
 
 namespace {
 
@@ -44,6 +50,64 @@ struct Params {                        // mirrors TcParams in tombola/native.py
   float grain_level, grain_density, grain_size, grain_position, grain_pitch;
   float grain_spread, grain_texture, grain_feedback;
   int grain_freeze, grain_source, grain_mode;
+  // synth voice for the balls (24 engines) and for the ring chord (ring_engine < 0: built-in timbres)
+  int synth_engine;
+  float synth_harmonics, synth_timbre, synth_morph, synth_decay, synth_colour;
+  int ring_engine;
+  float ring_harmonics, ring_timbre2, ring_morph;
+  // physical-modelling voice for the balls: exciter 0 strike, 1 bow, 2 blow, 3 all
+  int phys_exciter;
+  float phys_geometry, phys_brightness, phys_damping, phys_position, phys_space;
+};
+
+// One synth-engine voice. Balls ping its low-pass gate with a trigger; rings hold it
+// open with the level input, so a ring note gets darker as well as quieter as it fades.
+struct SynthVoice {
+  plaits::Voice voice;
+  char ram[16384];
+  plaits::Patch patch;
+  plaits::Modulations mod;
+  float gain = 0;
+  int trigger = 0;                     // blocks left with the trigger input high
+  void init(bool held) {
+    stmlib::BufferAllocator allocator(ram, sizeof(ram));
+    voice.Init(&allocator);
+    std::memset(&patch, 0, sizeof patch);
+    std::memset(&mod, 0, sizeof mod);
+    patch.note = 60; patch.harmonics = 0.5f; patch.timbre = 0.5f; patch.morph = 0.5f;
+    patch.decay = 0.5f; patch.lpg_colour = 0.5f;
+    mod.trigger_patched = !held;
+    mod.level_patched = held;
+  }
+  void render(float* l, float* r, int n, float pan) {      // n <= 24
+    plaits::Voice::Frame frames[24];
+    mod.trigger = trigger > 0 ? 1.0f : 0.0f;
+    if (trigger > 0) --trigger;
+    voice.Render(patch, mod, frames, n);
+    for (int i = 0; i < n; ++i) {
+      float out = frames[i].out / 32768.0f, aux = frames[i].aux / 32768.0f;
+      l[i] += gain * (out * (1 - pan) + 0.35f * aux * pan);
+      r[i] += gain * (out * pan + 0.35f * aux * (1 - pan));
+    }
+  }
+};
+
+struct Hit { float note, strength; };
+
+// 32 kHz -> 48 kHz linear upsampler (stereo), fed one sample at a time.
+struct Upsampler {
+  float pos = 0, prev_l = 0, prev_r = 0;
+  template <typename F>
+  void run(const float* in_l, const float* in_r, int n_in, float* out_l, float* out_r, int n_out, F add) {
+    int k = 0;
+    for (int i = 0; i < n_out; ++i) {
+      float cl = in_l[std::min(k, n_in - 1)], cr = in_r[std::min(k, n_in - 1)];
+      add(out_l[i], prev_l + (cl - prev_l) * pos);
+      add(out_r[i], prev_r + (cr - prev_r) * pos);
+      pos += 2.0f / 3.0f;
+      if (pos >= 1.0f) { pos -= 1.0f; prev_l = cl; prev_r = cr; ++k; }
+    }
+  }
 };
 
 // Sustained ring-chord timbres: (ratio, amplitude) harmonic sets.
@@ -143,6 +207,16 @@ struct Engine {
   float up_prev_l = 0, up_prev_r = 0;
   std::vector<float> c_in_l, c_in_r, c_out_l, c_out_r;
   long grains = 0;                     // grain estimate for the visual sparks
+  SynthVoice synth[4];                 // ball synth voices, round-robin
+  int synth_next = 0;
+  std::deque<Hit> synth_hits;
+  SynthVoice ring_synth[4];            // ring chord voices when the ring timbre is a synth engine
+  elements::Part physical;             // physical-modelling ball voice
+  uint16_t physical_reverb[32768];
+  std::deque<Hit> physical_hits;
+  int physical_gate = 0;               // 32 kHz blocks left with the gate on
+  float physical_note = 60, physical_strength = 0;
+  Upsampler physical_up;
   float grain_clock = 0;
 
   void init() {
@@ -153,6 +227,9 @@ struct Engine {
     clouds.set_playback_mode(clouds::PLAYBACK_MODE_GRANULAR);
     clouds.Prepare();
     reverb.Init(reverb_buffer);
+    for (auto& v : synth) v.init(false);
+    for (auto& v : ring_synth) v.init(true);
+    physical.Init(physical_reverb);
     reverb.set_diffusion(0.7f);
     reverb.set_lp(0.7f);
     reverb.set_time(0.75f);
@@ -172,6 +249,8 @@ struct Engine {
       }
     }
     rings_live = 4;
+    ring_count_live = ring_count;
+    for (int k = 0; k < ring_count; ++k) { ring_notes_live[k] = ring_midis[k]; ring_gains_live[k] = ring_gains[k]; }
     while (!incoming.empty()) {
       Sample s = std::move(incoming.front());
       incoming.pop_front();
@@ -228,6 +307,98 @@ struct Engine {
     }
   }
   float last_note = 60;
+
+  // Trigger/gate length for synth hits: short pings, but the DX7-style engines (2-4) use it as
+  // a held gate (their envelopes need note-on time), so it follows DECAY there.
+  int gate_blocks() const {
+    int engine = std::max(0, std::min(23, p.synth_engine));
+    if (engine >= 2 && engine <= 4) return 4 + int(p.synth_decay * 160);   // ~2 ms .. 80 ms per 0.5 ms
+    return 2;
+  }
+
+  void render_synth(float* l, float* r) {
+    {
+      std::lock_guard<std::mutex> g(lock);
+      while (!synth_hits.empty()) {
+        Hit h = synth_hits.front();
+        synth_hits.pop_front();
+        SynthVoice& v = synth[synth_next];
+        synth_next = (synth_next + 1) % 4;
+        v.patch.note = h.note;
+        v.gain = 0.9f * h.strength;
+        v.trigger = gate_blocks();
+      }
+    }
+    for (int k = 0; k < 4; ++k) {
+      SynthVoice& v = synth[k];
+      v.patch.engine = std::max(0, std::min(23, p.synth_engine));
+      v.patch.harmonics = p.synth_harmonics; v.patch.timbre = p.synth_timbre; v.patch.morph = p.synth_morph;
+      v.patch.decay = p.synth_decay; v.patch.lpg_colour = p.synth_colour;
+      for (int b = 0; b < kChunk; b += 24) v.render(l + b, r + b, 24, 0.25f + 0.17f * k);
+    }
+  }
+
+  void render_ring_synth(float* l, float* r) {
+    for (int k = 0; k < 4; ++k) {
+      SynthVoice& v = ring_synth[k];
+      bool live = k < ring_count_live;
+      v.patch.engine = std::max(0, std::min(23, p.ring_engine));
+      v.patch.note = live ? ring_notes_live[k] : v.patch.note;
+      v.patch.harmonics = p.ring_harmonics; v.patch.timbre = p.ring_timbre2; v.patch.morph = p.ring_morph;
+      v.patch.decay = 0.5f; v.patch.lpg_colour = 0.5f;
+      float target = live ? ring_gains_live[k] : 0.0f;
+      v.mod.level += (target - v.mod.level) * 0.2f;           // smooth: no zipper on the gate
+      v.gain = 0.6f * p.ring_level;
+      for (int b = 0; b < kChunk; b += 24) v.render(l + b, r + b, 24, 0.2f + 0.2f * k);
+    }
+  }
+  int ring_count_live = 0;
+  float ring_notes_live[4]{}, ring_gains_live[4]{};
+
+  void render_physical(float* l, float* r) {
+    elements::Patch* ep = physical.mutable_patch();
+    int ex = std::max(0, std::min(3, p.phys_exciter));
+    ep->exciter_envelope_shape = ex == 0 ? 0.0f : 0.6f;
+    ep->exciter_strike_level = (ex == 0 || ex == 3) ? 0.8f : 0.0f;
+    ep->exciter_bow_level = (ex == 1 || ex == 3) ? 0.8f : 0.0f;
+    ep->exciter_blow_level = (ex == 2 || ex == 3) ? 0.8f : 0.0f;
+    ep->exciter_strike_meta = 0.5f; ep->exciter_strike_timbre = 0.5f;
+    ep->exciter_bow_timbre = 0.5f; ep->exciter_blow_meta = 0.5f; ep->exciter_blow_timbre = 0.5f;
+    ep->exciter_signature = 0.0f;
+    ep->resonator_geometry = p.phys_geometry;
+    ep->resonator_brightness = p.phys_brightness;
+    ep->resonator_damping = p.phys_damping;
+    ep->resonator_position = p.phys_position;
+    ep->resonator_modulation_frequency = 0.0f;
+    ep->resonator_modulation_offset = 0.0f;
+    ep->reverb_diffusion = 0.7f; ep->reverb_lp = 0.7f;
+    ep->space = p.phys_space;
+    ep->modulation_frequency = 0.0f;
+    {
+      std::lock_guard<std::mutex> g(lock);
+      if (!physical_hits.empty()) {
+        Hit h = physical_hits.front();
+        physical_hits.pop_front();
+        physical_note = h.note;
+        physical_strength = h.strength;
+        physical_gate = ex == 0 ? 6 : 1600;                   // 16-sample blocks: strike 3 ms, bow/blow 0.8 s
+      }
+    }
+    const int kBlock32 = 16;
+    float main32[32], aux32[32], silence[kBlock32]{};
+    for (int b = 0; b < 32; b += kBlock32) {
+      elements::PerformanceState ps;
+      ps.gate = physical_gate > 0;
+      ps.note = physical_note;
+      ps.modulation = 0.0f;
+      ps.strength = physical_strength;
+      if (physical_gate > 0) --physical_gate;
+      physical.Process(ps, silence, silence, main32 + b, aux32 + b, kBlock32);
+    }
+    static const float kExciterGain[4] = {2.5f, 0.6f, 0.1f, 0.1f};   // measured: even levels out
+    const float g = kExciterGain[ex];
+    physical_up.run(main32, aux32, 32, l, r, kChunk, [g](float& o, float x) { o += g * x; });
+  }
 
   void render_samples(float* l, float* r) {
     for (auto& s : samples) {
@@ -299,7 +470,15 @@ struct Engine {
     apply_staging();
     float balls_l[kChunk]{}, balls_r[kChunk]{}, rings_l[kChunk]{}, rings_r[kChunk]{};
     render_resonator(balls_l, balls_r);
+    render_synth(balls_l, balls_r);
+    render_physical(balls_l, balls_r);
     render_samples(balls_l, balls_r);
+    if (p.ring_engine >= 0) {
+      for (auto& v : ring) v.goal = 0;                         // hand over from the built-in voices
+      render_ring_synth(rings_l, rings_r);
+    } else {
+      for (auto& v : ring_synth) v.mod.level = 0;
+    }
     for (int k = 0; k < rings_live; ++k)
       ring[k].render(rings_l, rings_r, kChunk, std::max(0, std::min(4, p.ring_timbre)),
                      0.3f * p.ring_level, 0.2f + 0.2f * k);
@@ -378,6 +557,43 @@ int tc_render(void* h, int16_t* out, int frames) {
   int done = 0;
   for (; done + kChunk <= frames; done += kChunk) e->render_chunk(out + 2 * done);
   return done;
+}
+
+void tc_synth_hit(void* h, float note, float strength) {
+  Engine* e = static_cast<Engine*>(h);
+  std::lock_guard<std::mutex> g(e->lock);
+  if (e->synth_hits.size() < 16) e->synth_hits.push_back({note, strength});
+}
+
+void tc_physical_hit(void* h, float note, float strength) {
+  Engine* e = static_cast<Engine*>(h);
+  std::lock_guard<std::mutex> g(e->lock);
+  if (e->physical_hits.size() < 4) e->physical_hits.push_back({note, strength});
+}
+
+// The random-loop source for the RANDOM chord mode: a deja-vu random sequence.
+struct Sequence {
+  marbles::RandomGenerator generator;
+  marbles::RandomStream stream;
+  marbles::RandomSequence sequence;
+};
+
+void* tc_seq_create(unsigned seed) {
+  Sequence* s = new Sequence();
+  s->generator.Init(seed);
+  s->stream.Init(&s->generator);
+  s->sequence.Init(&s->stream);
+  return s;
+}
+
+void tc_seq_destroy(void* h) { delete static_cast<Sequence*>(h); }
+
+// Next value in [0, 1): deja_vu 0 = always new, 0.5 = locked loop, 1 = shuffled loop.
+float tc_seq_next(void* h, float deja_vu, int length) {
+  Sequence* s = static_cast<Sequence*>(h);
+  s->sequence.set_deja_vu(deja_vu);
+  s->sequence.set_length(length);
+  return s->sequence.NextValue(false, 0.0f);
 }
 
 long tc_grains(void* h) { return static_cast<Engine*>(h)->grains; }

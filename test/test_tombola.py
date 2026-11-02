@@ -732,6 +732,85 @@ class NativeCoreTest(unittest.TestCase):
         self.run_for(m, 5, lambda mm, b: mm.strike(57 + b % 12, 0.8) if b % 20 == 0 else None)
         self.assertLess(time.perf_counter() - start, 1.5)        # 5 s of audio, typically ~0.15 s
 
+    def test_every_synth_engine_sounds(self):
+        for i, name in enumerate(native.ENGINES):
+            m = self.mixer()
+            m.synth["engine"] = i
+            m.synth_hit(57, 1.0)
+            self.assertGreater(self.rms(self.run_for(m, 0.5)[0]), 150, name)
+
+    def test_ring_synth_gate_follows_the_moon_level(self):
+        def ring(level):
+            m = self.mixer()
+            m.bed = 0.5
+            m.ring_synth["engine"] = native.ENGINES.index("CHORDS")
+            left = self.run_for(m, 1.0, lambda mm, b: mm.set_rings([(57, level), (64, level)]))[0][24000:]
+            hi = sum(self.mag(left, 220 * k, 0, 9600) for k in (4, 5, 6))
+            lo = self.mag(left, 220, 0, 9600) + self.mag(left, 329.6, 0, 9600)
+            return self.rms(left), hi / lo
+        (loud, bright_loud), (quiet, bright_quiet) = ring(1.0), ring(0.1)
+        self.assertGreater(loud, 3 * quiet)                      # quieter ...
+        self.assertGreater(bright_loud, 1.5 * bright_quiet)      # ... and darker, like a low-pass gate
+
+    def test_every_exciter_sounds_pitched(self):
+        for i, name in enumerate(native.EXCITERS):
+            m = self.mixer()
+            m.physical["exciter"] = i
+            m.physical_hit(57, 1.0)
+            left, right = self.run_for(m, 1.0)
+            mono = [a + b for a, b in zip(left, right)]
+            self.assertGreater(self.rms(mono), 300, name)
+            self.assertGreater(self.mag(mono, 220.0), 3 * self.mag(mono, 220.0 * 2 ** (-1 / 12)), name)
+
+    def test_native_random_loop_deja_vu(self):
+        from marbles import LoopSequencer
+        mk = lambda **kw: LoopSequencer(lambda seed: native.RandomSource(LIB, seed), **kw)
+        locked = mk(deja=0.5, length=4, spread=1.0)
+        out = [locked.next() for _ in range(24)]
+        self.assertTrue(all(out[i] == out[i + 4] for i in range(20)))      # 50%: exact loop
+        free = mk(deja=0.0, length=4, spread=1.0)
+        out = [free.next() for _ in range(40)]
+        self.assertFalse(all(out[i] == out[i + 4] for i in range(36)))
+        one = mk(deja=0.0, spread=0.0, bias=1.0)
+        self.assertEqual({one.next() for _ in range(30)}, {0})             # spread 0, bias stable: I only
+        q = mk()
+        q.next()
+        q.regenerate()
+        self.assertEqual((q.steps, q.current), (0, 0))
+
+    def test_engine_routes_synth_and_physical_hits(self):
+        from physics import Hit
+        e = app.Engine(app.make_params(), mixer=native.NativeMixer(LIB))
+        self.assertIsInstance(e.sequencer, __import__("marbles").LoopSequencer)
+        for instr, method in (("SYNTH", "synth_hit"), ("PHYSICAL", "physical_hit")):
+            e.params["instr"].index = e.params["instr"].values.index(instr)
+            e.apply()
+            calls = []
+            setattr(e.mixer, method, lambda midi, strength: calls.append(midi))
+            e.world.step = lambda dt: [Hit(0, 0, 2.0, 0)]
+            e.step(1 / 120)
+            self.assertEqual(len(calls), 1, instr)
+        e.params["sengine"].index = e.params["sengine"].values.index("STRINGS")
+        e.params["tone"].index = e.params["tone"].values.index("CHORDS")
+        e.apply()
+        self.assertEqual(e.mixer.synth["engine"], native.ENGINES.index("STRINGS"))
+        self.assertEqual(e.mixer.ring_synth["engine"], native.ENGINES.index("CHORDS"))
+
+    def test_pages_show_the_voice_controls(self):
+        ps = app.make_params()
+        by = {p.key: p for p in ps}
+        for instr, keys in (("SYNTH", ("sengine", "sharm", "stimb", "smorph", "sdecay", "scolour")),
+                            ("PHYSICAL", ("pexc", "pgeo", "pbright", "pdamp", "ppos", "pspace"))):
+            by["instr"].index = by["instr"].values.index(instr)
+            side, knobs = app.page_params(ps, "BALLS")
+            got = {p.key for p in side + knobs}
+            self.assertTrue(set(keys) <= got, instr)
+            self.assertNotIn("attack", got)
+        by["tone"].index = by["tone"].values.index("STRINGS")
+        self.assertTrue({"rharm", "rtimb", "rmorph"} <= {p.key for p in sum(app.page_params(ps, "RINGS"), [])})
+        by["tone"].index = by["tone"].values.index("WARM")
+        self.assertFalse({"rharm"} & {p.key for p in sum(app.page_params(ps, "RINGS"), [])})
+
     def test_python_engine_can_be_forced(self):
         self.assertEqual(os.environ.get("TOMBOLA_ENGINE"), "python")
         self.assertEqual(app.make_mixer().name, "python")
@@ -1101,6 +1180,17 @@ class AppTest(unittest.TestCase):
             e.params["instr"].index = 0
             e.undo()                                             # history entries migrate too
             self.assertEqual((e.v("instr"), e.v("chord")), ("RESONATOR", "RANDOM"))
+
+    def test_native_only_voices_have_python_stand_ins(self):
+        e = app.Engine(app.make_params())                      # Python engine (forced in this module)
+        for instr in ("SYNTH", "PHYSICAL"):
+            e.params["instr"].index = e.params["instr"].values.index(instr)
+            e.params["tone"].index = e.params["tone"].values.index("STRINGS")
+            e.apply()
+            self.assertIn(e.note_args(0, 0)[1], ("BELL", "MARIMBA"))
+            self.assertEqual(e.mixer.ring_timbre, "WARM")
+            for _ in range(10):
+                e.mixer.render()
 
     def test_param_nudge_clamps(self):
         p = next(p for p in app.make_params() if p.key == "octave")

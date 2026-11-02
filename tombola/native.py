@@ -17,6 +17,11 @@ SAMPLE_RATE = 48000
 CHANNELS = 2
 BLOCK = 480                      # 10 ms; a multiple of the core's 48-frame chunk
 TIMBRES = ("WARM", "GLASS", "SINE", "ORGAN", "SAW")
+# The synth voice's 24 engines, in the order the voice registers them.
+ENGINES = ("VA-VCF", "PHASE-D", "6OP-A", "6OP-B", "6OP-C", "TERRAIN", "STRINGS", "CHIP",
+           "VA", "WAVESHP", "FM", "GRAIN", "ADDITIVE", "WAVETBL", "CHORDS", "SPEECH",
+           "SWARM", "NOISE", "PARTICLE", "STRING", "MODAL", "KICK", "SNARE", "HIHAT")
+EXCITERS = ("STRIKE", "BOW", "BLOW", "ALL")
 SOURCES = ("ALL", "BALLS", "RINGS")
 GRAIN_MODES = ("GRANULAR", "STRETCH", "DELAY", "SPECTRAL")
 GROUPS = {"balls": 0}
@@ -32,7 +37,15 @@ class TcParams(ctypes.Structure):     # mirrors Params in native/tombola_core.cc
                 ("grain_size", ctypes.c_float), ("grain_position", ctypes.c_float),
                 ("grain_pitch", ctypes.c_float), ("grain_spread", ctypes.c_float),
                 ("grain_texture", ctypes.c_float), ("grain_feedback", ctypes.c_float),
-                ("grain_freeze", ctypes.c_int), ("grain_source", ctypes.c_int), ("grain_mode", ctypes.c_int)]
+                ("grain_freeze", ctypes.c_int), ("grain_source", ctypes.c_int), ("grain_mode", ctypes.c_int),
+                ("synth_engine", ctypes.c_int), ("synth_harmonics", ctypes.c_float),
+                ("synth_timbre", ctypes.c_float), ("synth_morph", ctypes.c_float),
+                ("synth_decay", ctypes.c_float), ("synth_colour", ctypes.c_float),
+                ("ring_engine", ctypes.c_int), ("ring_harmonics", ctypes.c_float),
+                ("ring_timbre2", ctypes.c_float), ("ring_morph", ctypes.c_float),
+                ("phys_exciter", ctypes.c_int), ("phys_geometry", ctypes.c_float),
+                ("phys_brightness", ctypes.c_float), ("phys_damping", ctypes.c_float),
+                ("phys_position", ctypes.c_float), ("phys_space", ctypes.c_float)]
 
 
 def load():
@@ -51,6 +64,13 @@ def load():
                                  ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float)]
     lib.tc_render.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int16), ctypes.c_int]
     lib.tc_render.restype = ctypes.c_int
+    for name in ("tc_synth_hit", "tc_physical_hit"):
+        getattr(lib, name).argtypes = [ctypes.c_void_p, ctypes.c_float, ctypes.c_float]
+    lib.tc_seq_create.restype = ctypes.c_void_p
+    lib.tc_seq_create.argtypes = [ctypes.c_uint]
+    lib.tc_seq_destroy.argtypes = [ctypes.c_void_p]
+    lib.tc_seq_next.argtypes = [ctypes.c_void_p, ctypes.c_float, ctypes.c_int]
+    lib.tc_seq_next.restype = ctypes.c_float
     lib.tc_grains.argtypes = [ctypes.c_void_p]
     lib.tc_grains.restype = ctypes.c_long
     lib.tc_voices.argtypes = [ctypes.c_void_p]
@@ -84,6 +104,9 @@ class NativeMixer:
         self.wet, self.volume, self.bed = 0.4, 0.7, 0.0
         self.ring_timbre, self.grain_source = "WARM", "ALL"
         self.res = dict(model=0, poly=4, structure=0.25, brightness=0.55, damping=0.5, position=0.3)
+        self.synth = dict(engine=8, harmonics=0.5, timbre=0.5, morph=0.5, decay=0.5, colour=0.5)
+        self.ring_synth = dict(engine=-1, harmonics=0.5, timbre=0.5, morph=0.5)      # -1: built-in timbres
+        self.physical = dict(exciter=0, geometry=0.5, brightness=0.5, damping=0.5, position=0.3, space=0.3)
         self.cache = {}
         self._params = TcParams()
         self._out = (ctypes.c_int16 * (BLOCK * CHANNELS))()
@@ -111,6 +134,14 @@ class NativeMixer:
     def strike(self, midi, strength):
         """A ball hitting the resonator: strength sets the exciter level."""
         self.lib.tc_strike(self.handle, float(midi), float(strength))
+
+    def synth_hit(self, midi, strength):
+        """A ball hitting with the synth voice: pings its low-pass gate."""
+        self.lib.tc_synth_hit(self.handle, float(midi), float(strength))
+
+    def physical_hit(self, midi, strength):
+        """A ball exciting the physical-modelling voice (strike, bow or blow)."""
+        self.lib.tc_physical_hit(self.handle, float(midi), float(strength))
 
     def set_rings(self, targets):
         n = min(4, len(targets))
@@ -140,9 +171,32 @@ class NativeMixer:
         p.grain_freeze = int(bool(c.freeze))
         p.grain_source = SOURCES.index(self.grain_source) if self.grain_source in SOURCES else 0
         p.grain_mode = GRAIN_MODES.index(c.mode) if c.mode in GRAIN_MODES else 0
+        s, rs, ph = self.synth, self.ring_synth, self.physical
+        p.synth_engine, p.synth_harmonics, p.synth_timbre = s["engine"], s["harmonics"], s["timbre"]
+        p.synth_morph, p.synth_decay, p.synth_colour = s["morph"], s["decay"], s["colour"]
+        p.ring_engine, p.ring_harmonics = rs["engine"], rs["harmonics"]
+        p.ring_timbre2, p.ring_morph = rs["timbre"], rs["morph"]
+        p.phys_exciter, p.phys_geometry, p.phys_brightness = ph["exciter"], ph["geometry"], ph["brightness"]
+        p.phys_damping, p.phys_position, p.phys_space = ph["damping"], ph["position"], ph["space"]
         self.lib.tc_set_params(self.handle, ctypes.byref(p))
         n = n // 48 * 48
         out = self._out if n == BLOCK else (ctypes.c_int16 * (n * CHANNELS))()
         done = self.lib.tc_render(self.handle, out, n)
         c._count = self.grain_count
         return bytes(memoryview(out).cast("B")[:done * CHANNELS * 2])
+
+
+class RandomSource:
+    """The deja-vu random sequence behind the RANDOM chord loop (values in [0, 1))."""
+
+    def __init__(self, lib, seed=1):
+        self.lib = lib
+        self.handle = lib.tc_seq_create(seed)
+
+    def next(self, deja_vu, length):
+        return self.lib.tc_seq_next(self.handle, deja_vu, length)
+
+    def __del__(self):
+        if getattr(self, "handle", None):
+            self.lib.tc_seq_destroy(self.handle)
+            self.handle = None

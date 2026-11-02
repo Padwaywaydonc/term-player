@@ -111,6 +111,15 @@ Saturn rings:
   own reverb), with `BRIGHTNESS` (wood/nylon → glass/steel), `DAMPING`, `POSITION`
   (where the strike lands; the centre cancels even harmonics) and `POLY` (1, 2 or
   4 voices). Harder hits strike harder.
+  `INSTR` `SYNTH` triggers a synth voice with 24 engines (`ENGINE`: virtual
+  analog with or without filter, phase distortion, three 6-operator FM banks,
+  wave terrain, string machine, chiptune, waveshaping, 2-op FM, grain/formant,
+  additive, wavetable, chords, speech, swarm, noise, particles, string, modal,
+  kick, snare, hi-hat) through its low-pass gate, with `HARMONICS`, `TIMBRE`,
+  `MORPH`, `DECAY` and `COLOUR` (the gate: VCA-like → filter-like); 4 voices
+  round-robin. `INSTR` `PHYSICAL` excites a modelled instrument — `EXCITER`
+  `STRIKE`, `BOW`, `BLOW` or `ALL` — with `GEOMETRY` (string → bar → plate →
+  bell), `BRIGHTNESS`, `DAMPING`, `POSITION` and `SPACE` (its own reverb).
 - **Rings** are the chord. They circle the polygon as tilted ellipses (the
   near, lower half passes in front of it, the far half behind). Each ring sounds
   one chord note continuously — `RINGS` sets how many: root, + fifth, + third,
@@ -119,7 +128,11 @@ Saturn rings:
   its ring and lets it fade toward the lowest — `TILT` moves those points, so it
   reshapes the swell (`FLOOR` is the volume left at the lowest point: 0% silent,
   100% a steady drone). Moons
-  grow and glow as they get louder. You choose the chord: `CHORD` holds a scale
+  grow and glow as they get louder. The rings' `INSTR` is one of five built-in
+  timbres or any of the 24 synth engines; with an engine (string machine,
+  chords, additive, wavetable, 6-op FM, …) each ring is a synth voice whose
+  low-pass gate the moon holds open, so a note grows darker as well as quieter
+  as its moon sinks, and `HARMONICS`, `TIMBRE`, `MORPH` appear on the RINGS page. You choose the chord: `CHORD` holds a scale
   degree (`I`…`VII`, also keys `1`–`7` on the RINGS and CHORDS pages), runs a
   progression, or `RANDOM` — a random chord loop (see the CHORDS page below).
 - **Grains** — a granular processor on its own `GRAINS` page. It records the
@@ -134,8 +147,11 @@ Saturn rings:
 
 **Audio engine.** `./install.sh` builds a small native core (`native/`, needs
 `make` and `g++`): 48 kHz stereo, with the resonator, granular processor and
-reverb DSP from Emilie Gillet's open-source eurorack code (MIT — see `NOTICE`),
-plus the ring-chord voices and the mix. If it isn't built, tombola falls back to
+reverb, synth voice, physical-modelling voice and random-sequence DSP from
+Emilie Gillet's open-source eurorack code (MIT — see `NOTICE`), plus the
+ring-chord voices and the mix. `SYNTH` and `PHYSICAL` ball voices and the
+synth-engine ring timbres need it (the Python engine stands in with `BELL`,
+`MARIMBA` and `WARM`). If it isn't built, tombola falls back to
 its pure-Python engine (22.05 kHz mono, simplified resonator and grains); the
 status line shows `48K` or `PY`, and `TOMBOLA_ENGINE=python` forces the fallback.
 Ball instruments `PLUCK` (Karplus-Strong), `BELL` (FM), `MARIMBA`, `GLASS`,
@@ -163,7 +179,9 @@ on `RANDOM` the chords come from a loop of `LENGTH` (1–16) steps: `DEJA VU` 0%
 draws a new chord every step, up to 50% replays the loop with growing
 probability (it slowly evolves), 50% locks it, above 50% shuffles it. `SPREAD`
 sets how far a new chord may jump, `BIAS` favours colourful (II, III, VII) or
-stable (I, IV, V, VI) chords. The row at the top shows the loop, the playing
+stable (I, IV, V, VI) chords. With the native core the loop runs on a deja-vu
+random sequence and each value maps to a chord on a colourful → stable ladder:
+`BIAS` sets where the chords centre, `SPREAD` how widely they vary (0 = one chord). The row at the top shows the loop, the playing
 chord lit and freshly regenerated ones marked with a dot. `g` regenerates the
 whole loop, `x` holds the current chord.
 

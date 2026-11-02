@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 from music import KEYS, SCALES, SHAPES
 from rings import RATIOS
+from native import ENGINES, EXCITERS
 from synth import INSTRUMENTS, RING_TIMBRES, Mixer
 from ui import VISUALS
 
@@ -21,7 +22,10 @@ PROGRESSIONS = {                 # or one that moves by itself every CHANGE seco
 RANDOM = "RANDOM"                # a random chord loop (see marbles.py)
 CHORDS = DEGREES + tuple(PROGRESSIONS) + (RANDOM,)
 RESONATOR = "RESONATOR"          # balls strike a modal / string resonator instead of playing a note
-BALL_INSTRUMENTS = INSTRUMENTS + (RESONATOR,)
+SYNTH = "SYNTH"                  # balls trigger a synth voice (24 engines) through its low-pass gate
+PHYSICAL = "PHYSICAL"            # balls strike, bow or blow a physically modelled instrument
+BALL_INSTRUMENTS = INSTRUMENTS + (RESONATOR, SYNTH, PHYSICAL)
+RING_TONES = tuple(RING_TIMBRES) + ENGINES                   # built-in timbres, then the synth engines
 RESONATOR_MODELS = ("MODAL", "SYMPATH", "STRING", "FM", "SYMP-Q", "STR+REV")
 GRAIN_MODES = ("GRANULAR", "STRETCH", "DELAY", "SPECTRAL")
 # Values renamed since earlier versions: saved settings and undo history are migrated on load.
@@ -30,6 +34,13 @@ RENAMED = {"instr": {"RINGS": RESONATOR}, "chord": {"MARBLES": RANDOM}}
 RESONATOR_PAGE = (("key", "scale", "instr", "rmodel", "shape", "visual", "window"),
                   ("balls", "grav", "rot", "bounce", "octave", "rstruct", "rbright", "rdamp", "rpos", "rpoly",
                    "reverb", "grain", "vol"))
+SYNTH_PAGE = (("key", "scale", "instr", "sengine", "shape", "visual", "window"),
+              ("balls", "grav", "rot", "bounce", "octave", "sharm", "stimb", "smorph", "sdecay", "scolour",
+               "reverb", "grain", "vol"))
+PHYSICAL_PAGE = (("key", "scale", "instr", "pexc", "shape", "visual", "window"),
+                 ("balls", "grav", "rot", "bounce", "octave", "pgeo", "pbright", "pdamp", "ppos", "pspace",
+                  "reverb", "grain", "vol"))
+RING_SYNTH_KNOBS = ("rharm", "rtimb", "rmorph")              # shown on RINGS when INSTR is a synth engine
 # Each page lists (side settings, knobs). Shared settings sit on both pages.
 PAGES = {
     "BALLS": (("key", "scale", "instr", "attack", "release", "shape", "visual", "window"),
@@ -50,6 +61,9 @@ RANDOM_RANGES = {
     "grain": (0, 60), "bed": (0, 70),
     "tone": None, "chord": None, "ratio": None, "change": (3, 12), "rings": (2, 4),
     "moons": (1, 3), "speed": (15, 70), "tilt": (4, 24), "floor": (0, 50),
+    "sengine": None, "sharm": (10, 90), "stimb": (10, 90), "smorph": (10, 90), "sdecay": (20, 80),
+    "scolour": (0, 100), "pexc": None, "pgeo": (0, 100), "pbright": (20, 90), "pdamp": (20, 80),
+    "ppos": (10, 90), "pspace": (10, 70), "rharm": (10, 90), "rtimb": (10, 90), "rmorph": (10, 90),
     "rmodel": None, "gmode": None, "rstruct": (0, 80), "rbright": (20, 90), "rdamp": (25, 80), "rpos": (10, 90), "rpoly": None,
     "clock": None, "jitter": (0, 40), "chance": (60, 100), "length": (4, 12), "deja": (0, 60),
     "cspread": (10, 90), "cbias": (30, 90),
@@ -113,7 +127,24 @@ def make_params():
         _p("vol", "VOL", range(0, 101, 5), 70, "{}%"),          # balls
         _p("rvol", "VOL", range(0, 101, 5), 70, "{}%"),         # rings: moons + pad
         _p("roct", "OCTAVE", range(-3, 4), 0, "{:+d}"),         # rings: pad + moons; 0 = lowest clearly audible, below = sub-bass
-        _p("tone", "INSTR", RING_TIMBRES, "WARM"),              # ring tones' timbre (RINGS page)
+        _p("tone", "INSTR", RING_TONES, "WARM"),                # ring tones' timbre (RINGS page)
+        _p("rharm", "HARMONICS", range(0, 101, 5), 50, "{}%"),  # ring synth-engine controls
+        _p("rtimb", "TIMBRE", range(0, 101, 5), 50, "{}%"),
+        _p("rmorph", "MORPH", range(0, 101, 5), 50, "{}%"),
+        # Synth ball voice (INSTR = SYNTH)
+        _p("sengine", "ENGINE", ENGINES, "VA"),
+        _p("sharm", "HARMONICS", range(0, 101, 5), 50, "{}%"),
+        _p("stimb", "TIMBRE", range(0, 101, 5), 50, "{}%"),
+        _p("smorph", "MORPH", range(0, 101, 5), 50, "{}%"),
+        _p("sdecay", "DECAY", range(0, 101, 5), 50, "{}%"),
+        _p("scolour", "COLOUR", range(0, 101, 5), 50, "{}%"),    # low-pass gate: VCA-like .. filter-like
+        # Physical-modelling ball voice (INSTR = PHYSICAL)
+        _p("pexc", "EXCITER", EXCITERS, "STRIKE"),
+        _p("pgeo", "GEOMETRY", range(0, 101, 5), 50, "{}%"),     # string .. bar .. plate .. bell
+        _p("pbright", "BRIGHTNESS", range(0, 101, 5), 50, "{}%"),
+        _p("pdamp", "DAMPING", range(0, 101, 5), 50, "{}%"),
+        _p("ppos", "POSITION", range(0, 101, 5), 30, "{}%"),
+        _p("pspace", "SPACE", range(0, 101, 5), 30, "{}%"),      # the voice's own stereo reverb
         _p("chord", "CHORD", CHORDS, "I"),
         _p("change", "CHANGE", (2, 3, 4, 6, 8, 12, 16), 6, "{} S"),
         # CHORDS page: when the chord moves (progressions and RANDOM) and the random loop
@@ -149,8 +180,12 @@ def page_params(params, page):
     """(side, knobs) Param lists for a page."""
     by_key = {p.key: p for p in params}
     side, knobs = PAGES[page]
-    if page == "BALLS" and by_key["instr"].value == RESONATOR:
-        side, knobs = RESONATOR_PAGE
+    if page == "BALLS":
+        side, knobs = {RESONATOR: RESONATOR_PAGE, SYNTH: SYNTH_PAGE,
+                       PHYSICAL: PHYSICAL_PAGE}.get(by_key["instr"].value, (side, knobs))
+    if page == "RINGS" and by_key["tone"].value in ENGINES:
+        at = knobs.index("floor") + 1
+        knobs = knobs[:at] + RING_SYNTH_KNOBS + knobs[at:]
     return [by_key[k] for k in side], [by_key[k] for k in knobs]
 
 

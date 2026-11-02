@@ -79,3 +79,60 @@ class ChordSequencer:
 
     def is_fresh(self, slot):
         return self.steps - self.fresh.get(slot, -FRESH_STEPS - 1) <= FRESH_STEPS
+
+
+# Chords from colourful to stable: the absolute ladder the native loop maps values onto.
+LADDER = (6, 2, 1, 5, 3, 4, 0)           # VII, III, II, VI, IV, V, I
+
+
+class LoopSequencer:
+    """RANDOM chord loop driven by the native deja-vu random sequence.
+
+    Same interface as ChordSequencer. The sequence repeats, evolves or shuffles
+    its random values exactly as DEJA VU says; each value maps to a chord
+    absolutely (not relative to the last one), so a locked loop really repeats:
+    BIAS sets where on the colourful -> stable ladder the chords centre, SPREAD
+    how widely they vary around it.
+    """
+
+    def __init__(self, source_factory, length=8, deja=0.25, spread=0.4, bias=0.6):
+        self.source_factory = source_factory
+        self.length, self.deja, self.spread, self.bias = length, deja, spread, bias
+        self.current = 0
+        self.steps = 0
+        self.pos = 0
+        self.loop = [0] * length                 # the last LENGTH chords, slot = step % LENGTH
+        self.fresh = {}
+        self.seed = 1
+        self.source = source_factory(self.seed)
+
+    def degree(self, u):
+        v = self.bias + (u - 0.5) * 2 * self.spread
+        return LADDER[min(6, max(0, int(v * 7)))]
+
+    def next(self):
+        self.steps += 1
+        d = self.degree(self.source.next(self.deja, self.length))
+        slot = (self.steps - 1) % self.length
+        if self.steps > self.length and self.loop[slot] != d:
+            self.fresh[slot] = self.steps                # differs from a loop ago: regenerated
+        self.loop[slot] = d
+        self.current = d
+        self.pos = (slot + 1) % self.length
+        return d
+
+    def regenerate(self):
+        """A fresh random sequence (new seed), starting from the tonic."""
+        self.seed += 1
+        self.source = self.source_factory(self.seed)
+        self.steps, self.current, self.pos = 0, 0, 0
+        self.loop = [0] * self.length
+        self.fresh = {i: 0 for i in range(self.length)}
+
+    def set_length(self, length):
+        self.loop = (self.loop + [0] * length)[:length]
+        self.length = length
+        self.pos %= length
+
+    def is_fresh(self, slot):
+        return self.steps - self.fresh.get(slot, -FRESH_STEPS - 1) <= FRESH_STEPS

@@ -12,20 +12,22 @@ import time
 import tty
 
 from music import SHAPES, pad_note
-from marbles import ChordSequencer
+from marbles import ChordSequencer, LoopSequencer
 import native
 from params import (CONFIG, DEGREES, HISTORY_MAX, PAGES, PROGRESSIONS, RANDOM, RANDOM_RANGES,  # noqa: F401
-                    RESONATOR, RESONATOR_MODELS,
+                    PHYSICAL, RESONATOR, RESONATOR_MODELS, SYNTH,
                     apply_snapshot, load_history, load_params, make_params, page_params, save_params,
                     snapshot)
 from physics import BALL_SIZES, World
 from backdrop import FPS as BACKDROP_FPS, Backdrop, scene_commands
 from resonator import STRENGTHS, RenderPool, strength_step
 from rings import TAU, Rings
-from synth import Mixer
+from native import ENGINES, EXCITERS
+from synth import RING_TIMBRES, Mixer
 import ui
 
 PHYS_DT = 1 / 120
+PY_STANDIN = {SYNTH: "BELL", PHYSICAL: "MARIMBA"}             # Python engine stand-ins
 PY_MODEL = {"MODAL": "MODAL", "SYMPATH": "SYMPATH", "STRING": "STRING",       # Python fallback stand-ins
             "FM": "MODAL", "SYMP-Q": "SYMPATH", "STR+REV": "STRING"}
 
@@ -62,7 +64,9 @@ class Engine:
         self.next_change = None                  # TIME clock: seconds until the next tick
         self.hold = False                        # x: freeze the moving chord
         self.rng = random.Random()
-        self.sequencer = ChordSequencer(rng=self.rng)
+        lib = native.load() if isinstance(self.mixer, native.NativeMixer) else None
+        self.sequencer = (LoopSequencer(lambda seed: native.RandomSource(lib, seed)) if lib
+                          else ChordSequencer(rng=self.rng))
         self._warm_jobs = []
         self._warm_wake = threading.Event()
         self._warm_thread = None
@@ -90,9 +94,19 @@ class Engine:
         c.freeze = self.v("freeze") == "ON"
         self.mixer.grain_source = self.v("source")
         self.mixer.bed = self.v("bed") / 100 * 0.45 * self.ring_vol() if self.on else 0.0
-        self.mixer.ring_timbre = self.v("tone")
+        tone = self.v("tone")
+        self.mixer.ring_timbre = tone if tone in RING_TIMBRES else "WARM"   # engines: native only
         c.mode = self.v("gmode")
         if self.native:
+            pc = lambda key: self.v(key) / 100
+            self.mixer.synth.update(engine=ENGINES.index(self.v("sengine")), harmonics=pc("sharm"),
+                                    timbre=pc("stimb"), morph=pc("smorph"), decay=pc("sdecay"),
+                                    colour=pc("scolour"))
+            self.mixer.ring_synth.update(engine=ENGINES.index(tone) if tone in ENGINES else -1,
+                                         harmonics=pc("rharm"), timbre=pc("rtimb"), morph=pc("rmorph"))
+            self.mixer.physical.update(exciter=EXCITERS.index(self.v("pexc")), geometry=pc("pgeo"),
+                                       brightness=pc("pbright"), damping=pc("pdamp"), position=pc("ppos"),
+                                       space=pc("pspace"))
             self.mixer.res.update(model=RESONATOR_MODELS.index(self.v("rmodel")), poly=self.v("rpoly"),
                                   structure=self.v("rstruct") / 100, brightness=self.v("rbright") / 100,
                                   damping=self.v("rdamp") / 100, position=self.v("rpos") / 100)
@@ -170,7 +184,8 @@ class Engine:
 
     def note_args(self, edge, ball_octave):
         midi = pad_note(self.v("key"), self.v("scale"), edge, self.v("octave"), ball_octave)
-        return midi, self.v("instr"), self.v("attack"), self.v("release")
+        instr = PY_STANDIN.get(self.v("instr"), self.v("instr"))     # native-only voices on Python
+        return midi, instr, self.v("attack"), self.v("release")
 
     def resonator_args(self, midi, strength):
         """Arguments for render_resonator: the hit's note, the resonator settings, the ring chord."""
@@ -234,9 +249,11 @@ class Engine:
     def step(self, dt):
         for hit in self.world.step(dt):
             strength = min(1.0, 0.08 + hit.speed / 2.0)               # hard hits louder (and brighter)
-            if self.native and self.v("instr") == RESONATOR:
+            if self.native and self.v("instr") in (RESONATOR, SYNTH, PHYSICAL):
                 midi = pad_note(self.v("key"), self.v("scale"), hit.edge, self.v("octave"), hit.octave)
-                self.mixer.strike(midi, strength * self.ball_vol())
+                play = {RESONATOR: self.mixer.strike, SYNTH: self.mixer.synth_hit,
+                        PHYSICAL: self.mixer.physical_hit}[self.v("instr")]
+                play(midi, strength * self.ball_vol())
                 self.hits += 1
                 continue
             buf = self.ball_sound(hit.edge, hit.octave, strength)
