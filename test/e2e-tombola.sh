@@ -67,8 +67,16 @@ grep -q 'MAJOR' <<<"$SCREEN2" || fail "hotkey c did not advance scale MINOR -> M
 tmux send-keys -t "$SESS" Tab Up
 sleep 0.5
 SCREEN3=$(tmux capture-pane -p -t "$SESS")
-for label in MOONS SPEED TILT PAD FLOOR CHORD CHANGE RATIO INSTR; do
+for label in MOONS SPEED TILT PAD FLOOR CHORD RATIO INSTR; do
     grep -q "$label" <<<"$SCREEN3" || fail "RINGS page is missing label $label"
+done
+
+# Tab on to CHORDS: the Marbles-style loop controls and the chord row.
+tmux send-keys -t "$SESS" Tab
+sleep 0.5
+SCREEN4=$(tmux capture-pane -p -t "$SESS")
+for label in CLOCK CHANGE JITTER CHANCE LENGTH "DEJA VU" SPREAD BIAS CHORD; do
+    grep -q "$label" <<<"$SCREEN4" || fail "CHORDS page is missing label $label"
 done
 sleep 3
 tmux send-keys -t "$SESS" q

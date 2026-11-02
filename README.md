@@ -104,6 +104,16 @@ Saturn rings:
 - **Balls** fall under gravity inside a spinning polygon. Every edge is a pad
   tuned to a step of the chosen scale; a ball that hits a pad hard enough plays
   it — small balls an octave up, large balls an octave down, harder hits louder.
+  With `INSTR` set to `RINGS` each hit instead strikes a resonator modelled on
+  Mutable Instruments Rings: `MODEL` `MODAL` (tuned partials, `STRUCTURE`
+  morphing string → bar → plate), `STRING` (Karplus-Strong string; `STRUCTURE`
+  adds stiffness for piano-like or inharmonic tones) or `SYMPATH` (the plucked
+  string plus sympathetic strings ringing along on octaves/fifths or the rings'
+  chord), with `BRIGHTNESS` (wood/nylon → glass/steel), `DAMPING` (0.08–10 s),
+  `POSITION` (where the strike lands; the centre cancels even harmonics) and
+  `POLY` (1 voice: each hit chokes the last; up to 4 ring together). Harder
+  hits strike brighter. The hits render in background processes, so changing a
+  setting never interrupts the sound.
 - **Rings** are the chord. They circle the polygon as tilted ellipses (the
   near, lower half passes in front of it, the far half behind). Each ring sounds
   one chord note continuously — `RINGS` sets how many: root, + fifth, + third,
@@ -113,8 +123,9 @@ Saturn rings:
   reshapes the swell (`FLOOR` is the volume left at the lowest point: 0% silent,
   100% a steady drone). Moons
   grow and glow as they get louder. You choose the chord: `CHORD` holds a scale
-  degree (`I`…`VII`, also keys `1`–`7` on the RINGS page), or pick a
-  progression to let it move every `CHANGE` seconds.
+  degree (`I`…`VII`, also keys `1`–`7` on the RINGS and CHORDS pages), runs a
+  progression, or `MARBLES` — a random chord loop modelled on Mutable
+  Instruments Marbles (see the CHORDS page below).
 - **Grains** — a granular processor modelled on Mutable Instruments Clouds, on
   its own `GRAINS` page. It records the balls, the rings or both (`SOURCE`) into a
   2-second buffer and replays grains from it: `DENSITY` (negative = steady rate,
@@ -127,7 +138,7 @@ Saturn rings:
 
 Everything is pure Python (no extra packages): instruments `PLUCK`
 (Karplus-Strong), `BELL` (FM), `MARIMBA`, `GLASS`, `PAD`, `KALIMBA`, `VIBES`,
-`ORGAN`, `CHIME`, `SAW`, an attack/release
+`ORGAN`, `CHIME`, `SAW` (plus the `RINGS` resonator for the balls), an attack/release
 envelope and a reverb. Mono 22.05 kHz PCM is streamed to Windows `mpv.exe` on
 WSL, or to `pacat` / Linux `mpv` natively. Graphics default to `PIXEL`:
 half-block characters, two square pixels per cell with their own colour, which
@@ -143,23 +154,38 @@ the terminal, lower the profile's background opacity (Settings → your profile
 → Appearance → Background opacity, e.g. 60%, acrylic off). With `WINDOW` on, the
 small strip drops its own picture and shows just the controls.
 
-Settings are split over three pages — `Tab` switches:
+**CHORDS page — when and how the chord moves.** `CLOCK` `MOON` changes chord each
+time the outer ring's moon passes its highest point (so the harmony moves with
+the orbit you see); `TIME` every `CHANGE` seconds, varied by `JITTER`. `CHANCE`
+is a coin toss on every tick (Mutable Branches): change, or stay. With `CHORD`
+on `MARBLES` the chords come from a loop of `LENGTH` (1–16) steps: `DEJA VU` 0%
+draws a new chord every step, up to 50% replays the loop with growing
+probability (it slowly evolves), 50% locks it, above 50% shuffles it. `SPREAD`
+sets how far a new chord may jump, `BIAS` favours colourful (II, III, VII) or
+stable (I, IV, V, VI) chords. The row at the top shows the loop, the playing
+chord lit and freshly regenerated ones marked with a dot. `g` regenerates the
+whole loop, `x` holds the current chord.
+
+Settings are split over four pages — `Tab` switches:
 
 | Page    | Settings |
 |---------|----------|
-| `BALLS` | `KEY` `SCALE` `INSTR` `ATTACK` `RELEASE` `SHAPE` `VISUAL` `BALLS` `GRAV` `ROT` `BOUNCE` `OCTAVE` `REVERB` `GRAIN` `VOL` (ball volume) |
+| `BALLS` | `KEY` `SCALE` `INSTR` `ATTACK` `RELEASE` `SHAPE` `VISUAL` `BALLS` `GRAV` `ROT` `BOUNCE` `OCTAVE` `REVERB` `GRAIN` `VOL` (ball volume); with `INSTR` `RINGS`: `MODEL` `STRUCTURE` `BRIGHTNESS` `DAMPING` `POSITION` `POLY` in place of `ATTACK` `RELEASE` |
+| `CHORDS` | `KEY` `SCALE` `CHORD` `CLOCK` (`MOON` `TIME`) `VISUAL` `WINDOW` `CHANGE` `JITTER` `CHANCE` `LENGTH` `DEJA VU` `SPREAD` `BIAS` `OCTAVE` |
 | `GRAINS` | `KEY` `SCALE` `SOURCE` (`ALL` `BALLS` `RINGS`) `FREEZE` `VISUAL` `WINDOW` `GRAIN` (level) `DENSITY` `SIZE` `POSITION` `PITCH` `SPREAD` `TEXTURE` `FEEDBACK` `REVERB` |
-| `RINGS` | `KEY` `SCALE` `INSTR` (ring timbre: `WARM` `GLASS` `SINE` `ORGAN` `SAW`) `CHORD` (held degree `I`…`VII`, or a progression) `CHANGE` (seconds per chord, progressions only) `RATIO` (orbit speeds: `KEPLER` outer-slower, `HARM`, `PRIME`, `GOLD`, `SYNC`) `VISUAL` `WINDOW` `RINGS` (chord notes, 0–4) `MOONS` (swells per orbit) `SPEED` `TILT` `OCTAVE` (−3…+3; 0 = lowest clearly audible, below = sub-bass) `PAD` (ring level) `FLOOR` (volume with the moon at its lowest: 0% silent … 100% drone) `REVERB` `GRAIN` `VOL` (ring volume) |
+| `RINGS` | `KEY` `SCALE` `INSTR` (ring timbre: `WARM` `GLASS` `SINE` `ORGAN` `SAW`) `CHORD` (held degree `I`…`VII`, or a progression) `RATIO` (orbit speeds: `KEPLER` outer-slower, `HARM`, `PRIME`, `GOLD`, `SYNC`) `VISUAL` `WINDOW` `RINGS` (chord notes, 0–4) `MOONS` (swells per orbit) `SPEED` `TILT` `OCTAVE` (−3…+3; 0 = lowest clearly audible, below = sub-bass) `PAD` (ring level) `FLOOR` (volume with the moon at its lowest: 0% silent … 100% drone) `REVERB` `GRAIN` `VOL` (ring volume) |
 
 In a full-size pane every setting of the page is a knob along the bottom.
 
 | Key            | Action                                    |
 |----------------|-------------------------------------------|
-| `Tab`          | switch page: BALLS / RINGS / GRAINS       |
+| `Tab`          | switch page: BALLS / RINGS / CHORDS / GRAINS |
 | `←` / `→`      | select setting (also `h` / `l`)           |
 | `↑` / `↓`      | change it (also `k` / `j`)                |
 | `3` … `8`      | BALLS page: shape — triangle, square, pentagon … octagon |
-| `1` … `7`      | RINGS page: hold chord I … VII            |
+| `1` … `7`      | RINGS / CHORDS page: hold chord I … VII   |
+| `g`            | regenerate the MARBLES chord loop         |
+| `x`            | hold the current chord (no changes)       |
 | `s` / `S`      | next / previous shape                     |
 | `n` / `N`      | next / previous key                       |
 | `c` / `C`      | next / previous scale                     |

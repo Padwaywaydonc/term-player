@@ -246,7 +246,7 @@ def _hints(width, page="BALLS"):
     """Key hints that fit in width columns; page/shape/key/scale keys win over the rest.
 
     Digits mean shape on BALLS and chord degree on RINGS."""
-    swap = {"BALLS": None, "RINGS": ("1-7", "chord"), "GRAINS": ("f", "freeze")}[page]
+    swap = {"BALLS": None, "RINGS": ("1-7", "chord"), "CHORDS": ("g x", "new/hold"), "GRAINS": ("f", "freeze")}[page]
     hints = HINTS if swap is None else tuple(swap if h[1] == "shape" else h for h in HINTS)
     order = (0, 3, 4, 5, 6, 12, 10, 11, 8, 1, 2, 9, 7)
     keep, used = set(), 0
@@ -347,6 +347,23 @@ def scene(state, cols, rows):
                       state.get("fx"), state.get("bed_level", 0.0))
 
 
+def _chord_row(state, width):
+    """The CHORDS page's loop: current chord lit, freshly regenerated ones in amber with a dot."""
+    if not state.get("chords"):
+        return None
+    title, cells = state["chords"]
+    label = f"{fg(DIM)}{'HOLD' if state.get('hold') else title}{RESET} "
+    parts, used = [], 5
+    for name, current, fresh in cells:
+        text = f"{name}{'•' if fresh else ''}"
+        if used + len(text) + 3 > width:
+            break
+        style = SELECT if current else fg(AMBER if fresh else DIM)
+        parts.append(f"{style} {text} {RESET}")
+        used += len(text) + 3
+    return label + "".join(parts)
+
+
 def _render_compact(state, cols, rows, put):
     """Short panes (e.g. play's default 10% split): canvas left, controls right."""
     rings = state["rings"]
@@ -367,6 +384,9 @@ def _render_compact(state, cols, rows, put):
     if width - title_w >= 28:
         text_put(1, cols - 25, f"{hits}  {_status(state)}")
     lines, at = _flow(side + knobs, sel, width)
+    row = _chord_row(state, width)
+    if row:
+        lines, at = [row] + lines, at + 1
     room = rows - (2 if rows >= 3 else 1)       # header, and the hint line when there is space
     start = min(max(0, at - room // 2), max(0, len(lines) - room))
     for i, line in enumerate(lines[start:start + room]):
@@ -393,6 +413,9 @@ def render(state, cols, rows):
 
     put(1, 3, f"\x1b[1m{fg(ORANGE)}TOMBOLA{RESET}   {_tabs(state)}")
     put(2, 3, f"{fg(DIM)}GENERATIVE SYNTH{RESET}")
+    row = _chord_row(state, cols - 4)
+    if row:
+        put(3, 3, row)
     put(1, max(3, cols - 12), f"{fg(DIM)}HITS {RESET}{fg(BALL)}{state['hits'] % 10000:04d}{RESET}")
 
     grid = _knob_rows(side + knobs, cols - 4)

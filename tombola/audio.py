@@ -4,15 +4,18 @@ Both mpv.exe (via WSL interop) and pacat accept seconds of audio before a
 write blocks, so pipe back-pressure can't pace us: the thread instead stays a
 fixed LEAD ahead of the wall clock, which keeps hit-to-sound latency small.
 """
+import os
 import shlex
 import shutil
 import subprocess
 import threading
 import time
+import traceback
 
 from synth import BLOCK, SAMPLE_RATE
 
-LEAD = 0.10   # seconds of audio queued ahead of real time
+ERROR_LOG = os.path.expanduser("~/.cache/play/tombola-errors.log")
+LEAD = 0.20   # seconds queued ahead of real time: rides out brief stalls (thread contention, host load)
 
 
 def sink_command(audio, mpv_win="", linux_mpv="", sink=""):
@@ -24,7 +27,7 @@ def sink_command(audio, mpv_win="", linux_mpv="", sink=""):
     raw = ["--no-video", "--really-quiet", "--no-terminal", "--demuxer=rawaudio",
            "--demuxer-rawaudio-format=s16le", f"--demuxer-rawaudio-rate={SAMPLE_RATE}",
            "--demuxer-rawaudio-channels=1", "--cache=no", "--demuxer-readahead-secs=0",
-           "--audio-buffer=0.05", "-"]
+           "--audio-buffer=0.1", "-"]
     if audio == "wsl" and mpv_win:
         return [mpv_win, *raw]
     if shutil.which("pacat"):
@@ -43,6 +46,7 @@ class Output:
         self.proc = None
         self.error = "" if argv else "audio off"
         self.dsp = 0.0          # fraction of real time spent mixing
+        self._failed = False
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
@@ -67,15 +71,29 @@ class Output:
             if ahead < -0.25:                  # we stalled; resync instead of bursting
                 t0 = time.monotonic() - written / SAMPLE_RATE
             t = time.perf_counter()
-            pcm = self.mixer.render(BLOCK)
+            pcm = self._render()
             self.dsp = 0.9 * self.dsp + 0.1 * (time.perf_counter() - t) / block_s
             written += BLOCK
-            if self.proc and not self.error:
+            if self.proc and self.error != "audio sink exited":
                 try:
                     self.proc.stdin.write(pcm)
                     self.proc.stdin.flush()
                 except (BrokenPipeError, OSError):
                     self.error = "audio sink exited"
+
+    def _render(self):
+        """One block from the mixer; on any error, log it, show it, and play silence instead
+        of letting the audio thread die quietly."""
+        try:
+            return self.mixer.render(BLOCK)
+        except Exception as exc:                      # noqa: BLE001 — must never kill the audio thread
+            if not self._failed:                      # log the first one; later ones repeat it
+                self._failed = True
+                self.error = f"audio error: {type(exc).__name__} (see {ERROR_LOG})"
+                os.makedirs(os.path.dirname(ERROR_LOG), exist_ok=True)
+                with open(ERROR_LOG, "a") as f:
+                    f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + traceback.format_exc() + "\n")
+            return bytes(2 * BLOCK)
 
     def stop(self):
         self._stop.set()

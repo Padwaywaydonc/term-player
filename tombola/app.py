@@ -12,35 +12,43 @@ import time
 import tty
 
 from music import SHAPES, pad_note
-from params import (CONFIG, DEGREES, HISTORY_MAX, PAGES, PROGRESSIONS, RANDOM_RANGES,  # noqa: F401
+from marbles import ChordSequencer
+from params import (CONFIG, DEGREES, HISTORY_MAX, MARBLES, PAGES, PROGRESSIONS, RANDOM_RANGES,  # noqa: F401
                     apply_snapshot, load_history, load_params, make_params, page_params, save_params,
                     snapshot)
 from physics import BALL_SIZES, World
-from backdrop import Backdrop, scene_commands
-from rings import Rings
+from backdrop import FPS as BACKDROP_FPS, Backdrop, scene_commands
+from resonator import STRENGTHS, RenderPool, strength_step
+from rings import TAU, Rings
 from synth import Mixer
 import ui
 
 PHYS_DT = 1 / 120
 FRAME_DT = 1 / 30
 PAD_LOWEST = 40                  # E2 (~82 Hz): the pad's bass never goes below this
-PREWARM_KEYS = {"key", "scale", "instr", "attack", "release", "octave", "shape"}
+PREWARM_KEYS = {"key", "scale", "instr", "attack", "release", "octave", "shape",
+                "rmodel", "rstruct", "rbright", "rdamp", "rpos"}
 RING_ORDER = (1, 3, 2, 0)        # chord tones added as RINGS grows: root, +fifth, +third, +bass
 
 
 class Engine:
     """Everything except the terminal: usable headless from tests."""
 
-    def __init__(self, params, mixer=None):
+    def __init__(self, params, mixer=None, pool=None):
         self.params = {p.key: p for p in params}
+        self._pool = pool                        # resonator renders; started on first RINGS use
         self.world = World()
         self.rings = Rings()
         self.mixer = mixer or Mixer()
         self.hits = 0
         self.on = True
         self.history = []                        # settings before each r, newest last
-        self.chord_step = 0
+        self.chord_step = 0                      # progression position
         self.chord_timer = 0.0
+        self.next_change = None                  # TIME clock: seconds until the next tick
+        self.hold = False                        # x: freeze the moving chord
+        self.rng = random.Random()
+        self.sequencer = ChordSequencer(rng=self.rng)
         self._warm_jobs = []
         self._warm_wake = threading.Event()
         self._warm_thread = None
@@ -69,6 +77,10 @@ class Engine:
         self.mixer.grain_source = self.v("source")
         self.mixer.bed = self.v("bed") / 100 * 0.45 * self.ring_vol() if self.on else 0.0
         self.mixer.ring_timbre = self.v("tone")
+        q = self.sequencer
+        q.deja, q.spread, q.bias = self.v("deja") / 100, self.v("cspread") / 100, self.v("cbias") / 100
+        if q.length != self.v("length"):
+            q.set_length(self.v("length"))
 
     def ball_vol(self):
         return self.v("vol") / 100 * 1.2
@@ -83,8 +95,9 @@ class Engine:
     def chord(self, step):
         """[bass, root, third, fifth] of the current chord.
 
-        CHORD is either a held scale degree (I..VII) or a progression, which
-        moves every CHANGE seconds (step counts those moves).
+        CHORD is a held scale degree (I..VII), a progression (step counts its
+        moves) or MARBLES, the random loop's current chord; the CHORDS page sets
+        when moving chords move.
 
         0 on the rings' OCTAVE is the lowest voicing whose bass is at least
         PAD_LOWEST (clearly audible on any speaker); each step moves the whole
@@ -94,6 +107,8 @@ class Engine:
         name = self.v("chord")
         if name in DEGREES:
             degree = DEGREES.index(name)
+        elif name == MARBLES:
+            degree = self.sequencer.current
         else:
             prog = PROGRESSIONS[name]
             degree = prog[step % len(prog)]
@@ -138,13 +153,44 @@ class Engine:
         midi = pad_note(self.v("key"), self.v("scale"), edge, self.v("octave"), ball_octave)
         return midi, self.v("instr"), self.v("attack"), self.v("release")
 
+    def resonator_args(self, midi, strength):
+        """Arguments for render_resonator: the hit's note, the resonator settings, the ring chord."""
+        model = self.v("rmodel")
+        chord = tuple(self.chord(self.chord_step)) if model == "SYMPATH" else ()
+        return (midi, model, self.v("rstruct") / 100, self.v("rbright") / 100, self.v("rdamp") / 100,
+                self.v("rpos") / 100, strength_step(strength), chord)
+
+    @property
+    def pool(self):
+        if self._pool is None:
+            self._pool = RenderPool()
+        return self._pool
+
+    def close(self):
+        if self._pool:
+            self._pool.close()
+
+    def ball_sound(self, edge, ball_octave, strength=0.75):
+        """The hit's buffer; with RINGS possibly None for a moment after a setting change."""
+        if self.v("instr") == "RINGS":
+            midi = pad_note(self.v("key"), self.v("scale"), edge, self.v("octave"), ball_octave)
+            return self.pool.get(self.resonator_args(midi, strength))
+        return self.mixer.note(*self.note_args(edge, ball_octave))
+
     def prewarm(self):
         """Render every note the current setup can play, off the UI thread.
 
         One worker; a newer request supersedes the one in progress, so holding
         a key down costs one render pass, not a thread per key repeat.
         """
-        self._warm_jobs = [self.note_args(e, o) for e in range(self.world.sides) for _, o in BALL_SIZES]
+        jobs = [(e, o, s) for e in range(self.world.sides) for _, o in BALL_SIZES
+                for s in (STRENGTHS if self.v("instr") == "RINGS" else (0.75,))]
+        if self.v("instr") == "RINGS":               # the pool renders in other processes
+            for e, o, s in jobs:
+                midi = pad_note(self.v("key"), self.v("scale"), e, self.v("octave"), o)
+                self.pool.request(self.resonator_args(midi, s))
+            return
+        self._warm_jobs = jobs
         self._warm_wake.set()
         if self._warm_thread is None:
             self._warm_thread = threading.Thread(target=self._warm_loop, daemon=True)
@@ -157,20 +203,61 @@ class Engine:
             for job in self._warm_jobs:
                 if self._warm_wake.is_set():
                     break
-                self.mixer.note(*job)
+                self.ball_sound(*job)
 
     def step(self, dt):
         for hit in self.world.step(dt):
-            buf = self.mixer.note(*self.note_args(hit.edge, hit.octave))
-            self.mixer.trigger(buf, 0.4 * min(1.0, 0.08 + hit.speed / 2.0) * self.ball_vol())   # hard hits louder
+            strength = min(1.0, 0.08 + hit.speed / 2.0)               # hard hits louder (and brighter)
+            buf = self.ball_sound(hit.edge, hit.octave, strength)
+            if buf is None:                          # first-ever render of this note still running
+                continue
+            poly = self.v("rpoly") if self.v("instr") == "RINGS" else None
+            self.mixer.trigger(buf, 0.4 * strength * self.ball_vol(), group="balls", poly=poly)
             self.hits += 1
+        before = self.outer_moons()
         self.rings.step(dt)
-        if self.v("chord") in PROGRESSIONS:
-            self.chord_timer += dt
-            if self.chord_timer >= self.v("change"):
-                self.chord_timer = 0.0
-                self.chord_step += 1
+        if self.clock_tick(dt, before) and not self.hold and self.rng.random() < self.v("chance") / 100:
+            self.advance_chord()
         self.mixer.set_rings(self.ring_targets())
+
+    def moving(self):
+        return self.v("chord") in PROGRESSIONS or self.v("chord") == MARBLES
+
+    def outer_moons(self):
+        k = self.rings.count - 1
+        return self.rings.moon_angles(k) if k >= 0 else []
+
+    def clock_tick(self, dt, before):
+        """Is it time to (maybe) change chord? MOON: the outer ring's moon passed its
+        highest point. TIME: CHANGE seconds have passed, varied by JITTER."""
+        if not self.moving():
+            return False
+        if self.v("clock") == "MOON" and before:
+            top = self.rings.top_angle()
+            after = self.outer_moons()
+            return any((b - top) // TAU != (a - top) // TAU for b, a in zip(before, after))
+        if self.next_change is None:
+            self.next_change = self._time_interval()
+        self.chord_timer += dt
+        if self.chord_timer < self.next_change:
+            return False
+        self.chord_timer -= self.next_change          # keep the overshoot: no drift over time
+        self.next_change = self._time_interval()
+        return True
+
+    def _time_interval(self):
+        return self.v("change") * (1 + 0.75 * self.v("jitter") / 100 * self.rng.uniform(-1, 1))
+
+    def advance_chord(self):
+        if self.v("chord") == MARBLES:
+            self.sequencer.next()
+        else:
+            self.chord_step += 1
+
+    def regenerate(self):
+        """g: a brand-new random chord loop."""
+        self.sequencer.regenerate()
+        self.sequencer.current = self.sequencer.loop[0]
 
 
 # Direct hotkeys: (param, step) cycles a param, (param, "=", index) jumps to a value.
@@ -180,10 +267,12 @@ KEYMAP = {b"\x1b[C": "right", b"\x1b[D": "left", b"\x1b[A": "up", b"\x1b[B": "do
           b"s": ("shape", 1), b"S": ("shape", -1), b"n": ("key", 1), b"N": ("key", -1),
           b"c": ("scale", 1), b"C": ("scale", -1), b"i": ("instr", 1), b"I": ("instr", -1),
           b"v": ("visual", 1), b"w": ("window", 1), b"f": ("freeze", 1),
+          b"g": "regenerate", b"x": "hold",
           **{str(n).encode(): ("digit", n) for n in range(1, 10)}}
 # Digit keys mean different things per page: shape (sides 3-8) or chord degree (I-VII).
 DIGITS = {"BALLS": ("shape", lambda n: n - 3 if 3 <= n <= 8 else None),
-          "RINGS": ("chord", lambda n: n - 1 if 1 <= n <= 7 else None)}
+          "RINGS": ("chord", lambda n: n - 1 if 1 <= n <= 7 else None),
+          "CHORDS": ("chord", lambda n: n - 1 if 1 <= n <= 7 else None)}
 
 
 def parse_keys(data):
@@ -217,7 +306,9 @@ class Menu:
         return side + knobs
 
     def selected(self):
-        return self.items()[self.cursor[self.page]]
+        items = self.items()                     # the BALLS page changes size with INSTR
+        self.cursor[self.page] %= len(items)
+        return items[self.cursor[self.page]]
 
     def move(self, d):
         self.cursor[self.page] = (self.cursor[self.page] + d) % len(self.items())
@@ -265,6 +356,10 @@ def handle_key(k, engine, menu):
         engine.randomize()
     elif k == "undo":
         engine.undo()
+    elif k == "regenerate":
+        engine.regenerate()
+    elif k == "hold":
+        engine.hold = not engine.hold
     if changed:
         engine.apply()
         if changed.key in PREWARM_KEYS:
@@ -273,6 +368,7 @@ def handle_key(k, engine, menu):
 
 
 def run(output_factory, config=CONFIG):
+    sys.setswitchinterval(0.002)                 # hand the interpreter to the audio thread sooner
     params = load_params(config)
     engine = Engine(params)
     engine.history = load_history(config)
@@ -311,7 +407,7 @@ def run(output_factory, config=CONFIG):
                 acc -= PHYS_DT
             cols, rows = shutil.get_terminal_size()
             fx.update(engine.mixer, now)
-            sync_window(window, engine, fx)
+            sync_window(window, engine, fx, now)
             out.write(ui.render(ui_state(engine, menu, output, fx, window), cols, rows))
             out.flush()
             time.sleep(max(0.0, FRAME_DT - (time.monotonic() - now)))
@@ -321,17 +417,32 @@ def run(output_factory, config=CONFIG):
         out.flush()
         window.stop()
         output.stop()
+        engine.close()
         save_params(params, config, engine.history)
 
 
-def sync_window(window, engine, fx):
-    """Keep the Windows backdrop in step with the WINDOW setting and feed it a frame."""
+def sync_window(window, engine, fx, now=None):
+    """Keep the Windows backdrop in step with the WINDOW setting and feed it frames (at FPS)."""
     if engine.v("window") != "ON":
         window.stop()
         return
     window.start()
-    if window.running:
+    if window.running and (now is None or now - window.last_frame >= 1 / BACKDROP_FPS):
+        window.last_frame = now or 0.0
         window.submit(scene_commands(engine.world, engine.rings, fx, engine.v("bed") / 100, ui.FLASH_S))
+
+
+def chord_row(engine):
+    """(title, [(label, current, fresh)]) for the CHORDS page: the loop, progression or held chord."""
+    name = engine.v("chord")
+    if name == MARBLES:
+        q = engine.sequencer
+        playing = (q.pos - 1) % q.length
+        return "LOOP", [(DEGREES[d], i == playing, q.is_fresh(i)) for i, d in enumerate(q.loop)]
+    if name in PROGRESSIONS:
+        prog = PROGRESSIONS[name]
+        return "PROG", [(DEGREES[d], i == engine.chord_step % len(prog), False) for i, d in enumerate(prog)]
+    return "CHORD", [(name, True, False)]
 
 
 def ui_state(engine, menu, output=None, fx=None, window=None):
@@ -342,4 +453,5 @@ def ui_state(engine, menu, output=None, fx=None, window=None):
             "dsp": output.dsp if output else 0.0, "on": engine.on,
             "error": " ".join(e for e in (output.error if output else "",
                                           window.error if window else "") if e),
-            "fx": fx, "window": engine.v("window") == "ON"}
+            "fx": fx, "window": engine.v("window") == "ON",
+            "chords": chord_row(engine) if menu.page == "CHORDS" else None, "hold": engine.hold}

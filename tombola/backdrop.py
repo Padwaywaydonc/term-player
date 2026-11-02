@@ -13,7 +13,8 @@ import subprocess
 import threading
 
 SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backdrop.ps1")
-RING_STEPS = 120
+RING_STEPS = 72
+FPS = 20                         # backdrop frames per second: smooth enough, light on both sides
 
 EDGE, FLASH = (255, 135, 0), (255, 235, 160)
 BALL, MOON, RING, SPARK = (255, 250, 220), (255, 175, 0), (175, 95, 0), (255, 215, 175)
@@ -120,6 +121,7 @@ class Backdrop:
         self.proc = None
         self.error = ""
         self._latest = None
+        self.last_frame = -1.0
         self._wake = threading.Event()
         self._thread = None
 

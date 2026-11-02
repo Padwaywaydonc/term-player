@@ -49,6 +49,10 @@ class Rings:
         for k in range(self.count):
             self.phase[k] += self.omega(k) * dt
 
+    def top_angle(self):
+        """Orbit angle of every ring's highest point on screen (all rings share the shape)."""
+        return math.atan2(SQUASH * math.cos(self.tilt), math.sin(self.tilt)) + math.pi / 2
+
     def height(self, k):
         """Half the on-screen height of ring k (its tilted ellipse)."""
         rx = self.radius(k)

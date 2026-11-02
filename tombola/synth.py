@@ -215,15 +215,28 @@ class _RingVoice:
         self.gain = g1
 
 
+CHOKE = 256                      # samples to fade a choked voice out (no click)
+
+
 def _mix(voices, out):
-    """Add each [samples, pos, gain] voice's next len(out) samples; return finished voices."""
+    """Add each voice's next len(out) samples; return finished voices.
+
+    A voice is [samples, pos, gain] or [samples, pos, gain, group, fade]; fade
+    counts down the samples left of a choke fade-out (None when not choked).
+    """
     n, done = len(out), []
     for v in voices:
-        samples, pos, g = v
+        samples, pos, g = v[0], v[1], v[2]
         seg = samples[pos:pos + n]
-        out[:len(seg)] = map(operator.add, out[:len(seg)], [x * g for x in seg])
+        fade = v[4] if len(v) > 4 else None
+        if fade is None:
+            scaled = [x * g for x in seg]
+        else:
+            scaled = [x * g * max(0.0, (fade - j) / CHOKE) for j, x in enumerate(seg)]
+            v[4] = fade - n
+        out[:len(seg)] = map(operator.add, out[:len(seg)], scaled)
         v[1] = pos + n
-        if v[1] >= len(samples):
+        if v[1] >= len(samples) or (fade is not None and v[4] <= 0):
             done.append(v)
     return done
 
@@ -285,8 +298,12 @@ class GrainCloud:
         """Record src (unless frozen), spawn grains, return this block of grain output."""
         n = len(src)
         if not self.freeze:
-            if self.feedback and self._prev:              # soft-limit what is recorded: the loop
-                tanh, fb = math.tanh, self.feedback       # can never grow past full scale
+            if self.feedback and self._prev:
+                # Overlapping grains are louder than what they read; divide that cloud gain out
+                # so one trip round the loop is at most FEEDBACK (< 1): it echoes and dies away
+                # instead of locking up at full scale. tanh is only a last-resort limiter.
+                fb = self.feedback / max(1.0, self._cloud_gain())
+                tanh = math.tanh
                 block = [tanh(x + fb * g) for x, g in zip(src, self._prev)]
             else:
                 block = src
@@ -325,6 +342,11 @@ class GrainCloud:
         i = (self.wpos - self.filled + start) % size
         end = i + length
         return self.buf[i:end] if end <= size else self.buf[i:] + self.buf[:end - size]
+
+    def _cloud_gain(self):
+        """Worst-case gain from the recording to the cloud's output (all grains in phase)."""
+        overlap = max(1.0, abs(self.density) * self.MAX_RATE * self.size)
+        return 1.4 * self.level * math.sqrt(overlap)
 
     def _spawn(self, n, rng):
         rate = abs(self.density) * self.MAX_RATE
@@ -394,11 +416,18 @@ class Mixer:
             buf = self.cache[key] = render_note(midi, instr, attack_ms, release_s)
         return buf
 
-    def trigger(self, samples, gain):
+    def trigger(self, samples, gain, group=None, poly=None):
+        """Start a voice. With a group and poly, at most poly voices of that group ring:
+        the oldest is choked with a short fade (like re-plucking a string)."""
         with self.lock:
+            if group is not None and poly:
+                ringing = [v for v in self.voices if v[3] == group and v[4] is None]
+                for v in ringing[:max(0, len(ringing) - poly + 1)]:
+                    v[4] = CHOKE
             if len(self.voices) >= MAX_VOICES:
                 self.voices.pop(0)             # steal the oldest
-            self.voices.append([samples, 0, gain])
+            self.voices.append([samples, 0, gain, group, None])
+
 
     def set_rings(self, targets):
         """[(midi, gain 0..1)] for each ring; voices glide and ramp to them."""

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 from music import KEYS, SCALES, SHAPES
 from rings import RATIOS
+from resonator import MODELS
 from synth import INSTRUMENTS, RING_TIMBRES, Mixer
 from ui import VISUALS
 
@@ -18,13 +19,21 @@ PROGRESSIONS = {                 # or one that moves by itself every CHANGE seco
     "I-V-VI-IV": (0, 4, 5, 3),
     "I-III-VI-IV": (0, 2, 5, 3),
 }
-CHORDS = DEGREES + tuple(PROGRESSIONS)
+MARBLES = "MARBLES"              # a random chord loop (Mutable Instruments Marbles style)
+CHORDS = DEGREES + tuple(PROGRESSIONS) + (MARBLES,)
+BALL_INSTRUMENTS = INSTRUMENTS + ("RINGS",)    # RINGS: the resonator (Mutable Instruments Rings style)
+# With INSTR on RINGS the BALLS page swaps ATTACK/RELEASE for the resonator's controls.
+RESONATOR_PAGE = (("key", "scale", "instr", "rmodel", "shape", "visual", "window"),
+                  ("balls", "grav", "rot", "bounce", "octave", "rstruct", "rbright", "rdamp", "rpos", "rpoly",
+                   "reverb", "grain", "vol"))
 # Each page lists (side settings, knobs). Shared settings sit on both pages.
 PAGES = {
     "BALLS": (("key", "scale", "instr", "attack", "release", "shape", "visual", "window"),
               ("balls", "grav", "rot", "bounce", "octave", "reverb", "grain", "vol")),
-    "RINGS": (("key", "scale", "tone", "chord", "change", "ratio", "visual", "window"),
+    "RINGS": (("key", "scale", "tone", "chord", "ratio", "visual", "window"),
               ("rings", "moons", "speed", "tilt", "roct", "bed", "floor", "reverb", "grain", "rvol")),
+    "CHORDS": (("key", "scale", "chord", "clock", "visual", "window"),
+               ("change", "jitter", "chance", "length", "deja", "cspread", "cbias", "roct")),
     "GRAINS": (("key", "scale", "source", "freeze", "visual", "window"),
                ("grain", "density", "size", "position", "pitch", "spread", "texture", "feedback", "reverb")),
 }
@@ -37,6 +46,9 @@ RANDOM_RANGES = {
     "grain": (0, 60), "bed": (0, 70),
     "tone": None, "chord": None, "ratio": None, "change": (3, 12), "rings": (2, 4),
     "moons": (1, 3), "speed": (15, 70), "tilt": (4, 24), "floor": (0, 50),
+    "rmodel": None, "rstruct": (0, 80), "rbright": (20, 90), "rdamp": (25, 80), "rpos": (10, 90), "rpoly": None,
+    "clock": None, "jitter": (0, 40), "chance": (60, 100), "length": (4, 12), "deja": (0, 60),
+    "cspread": (10, 90), "cbias": (30, 90),
     "density": (-60, 80), "size": (40, 300), "position": (0, 80), "pitch": (-12, 12), "spread": (0, 70),
     "texture": (20, 100), "feedback": (0, 40), "source": None, "roct": (0, 2),
 }
@@ -74,7 +86,14 @@ def make_params():
     return [
         _p("key", "KEY", KEYS, "D#"),
         _p("scale", "SCALE", SCALES, "MINOR"),
-        _p("instr", "INSTR", INSTRUMENTS, "PLUCK"),
+        _p("instr", "INSTR", BALL_INSTRUMENTS, "PLUCK"),
+        # Resonator (INSTR = RINGS), after Mutable Instruments Rings
+        _p("rmodel", "MODEL", MODELS, "MODAL"),
+        _p("rstruct", "STRUCTURE", range(0, 101, 5), 25, "{}%"),  # partial ratios / stiffness / tuning
+        _p("rbright", "BRIGHTNESS", range(0, 101, 5), 55, "{}%"), # wood/nylon .. glass/steel
+        _p("rdamp", "DAMPING", range(0, 101, 5), 50, "{}%"),      # ring time 0.08 .. 10 s
+        _p("rpos", "POSITION", range(0, 101, 5), 30, "{}%"),      # strike point: 100% = centre
+        _p("rpoly", "POLY", (1, 2, 4), 4),                        # voices; 1 = each hit chokes the last
         _p("attack", "ATTACK", (1, 2, 5, 10, 20, 50, 100, 200, 500), 2, "{}MS"),
         _p("release", "RELEASE", [round(0.2 * i, 1) for i in range(1, 21)], 1.6, "{:.1f} S"),
         _p("shape", "SHAPE", SHAPES, "HEX"),
@@ -93,6 +112,14 @@ def make_params():
         _p("tone", "INSTR", RING_TIMBRES, "WARM"),              # ring tones' timbre (RINGS page)
         _p("chord", "CHORD", CHORDS, "I"),
         _p("change", "CHANGE", (2, 3, 4, 6, 8, 12, 16), 6, "{} S"),
+        # CHORDS page: when the chord moves (progressions and MARBLES) and the random loop
+        _p("clock", "CLOCK", ("MOON", "TIME"), "MOON"),          # outer moon at its peak / every CHANGE s
+        _p("jitter", "JITTER", range(0, 101, 5), 0, "{}%"),     # TIME clock: random variation
+        _p("chance", "CHANCE", range(0, 101, 5), 100, "{}%"),   # coin toss per tick: change or stay
+        _p("length", "LENGTH", range(1, 17), 8),
+        _p("deja", "DEJA VU", range(0, 101, 5), 25, "{}%"),     # 0 new, 50 locked, 100 shuffled
+        _p("cspread", "SPREAD", range(0, 101, 5), 40, "{}%"),   # how far a new chord may jump
+        _p("cbias", "BIAS", range(0, 101, 5), 60, "{}%"),       # colourful .. stable degrees
         _p("ratio", "RATIO", RATIOS, "KEPLER"),
         _p("rings", "RINGS", range(0, 5), 3),
         _p("moons", "MOONS", range(1, 5), 2),
@@ -117,6 +144,8 @@ def page_params(params, page):
     """(side, knobs) Param lists for a page."""
     by_key = {p.key: p for p in params}
     side, knobs = PAGES[page]
+    if page == "BALLS" and by_key["instr"].value == "RINGS":
+        side, knobs = RESONATOR_PAGE
     return [by_key[k] for k in side], [by_key[k] for k in knobs]
 
 

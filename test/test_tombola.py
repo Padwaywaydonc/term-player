@@ -18,10 +18,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import app  # noqa: E402
 import backdrop  # noqa: E402
 import pixels  # noqa: E402
+from marbles import STABLE, ChordSequencer  # noqa: E402
+import resonator  # noqa: E402
 import ui  # noqa: E402
 from music import SCALES, pad_note  # noqa: E402
 from physics import World  # noqa: E402
-from rings import Rings  # noqa: E402
+from rings import TAU, Rings  # noqa: E402
 from music import KEYS  # noqa: E402
 from synth import BLOCK, INSTRUMENTS, RING_TIMBRES, SAMPLE_RATE, Mixer, render_note  # noqa: E402
 
@@ -211,15 +213,23 @@ class SynthTest(unittest.TestCase):
         self.assertLess(box[0], 0.01)
 
     def test_feedback_cannot_run_away(self):
+        """Regression: FEEDBACK 85%, 500 ms grains, density +40 used to lock the output at full scale."""
         random.seed(5)
-        m = self._cloud_mixer(level=1.0, density=1.0, feedback=0.9, size=0.3)
-        m.trigger(m.note(60, "SAW", 2, 1.0), 0.8)
-        peak = 0
-        for _ in range(int(10 * SAMPLE_RATE / BLOCK)):
-            m.render()
-            peak = max(peak, max(map(abs, m.cloud._prev)))
-        self.assertLessEqual(max(map(abs, m.cloud.history)), 1.0)   # the recording stays bounded
-        self.assertLess(peak, 8.0)                                   # so the cloud can't explode
+        m = self._cloud_mixer(level=0.7, density=0.4, feedback=0.85, size=0.5, position=0.1,
+                              spread=0.1, texture=0.3, pitch=-1)
+        m.wet = 0.5
+        loud = []
+        for sec in range(40):
+            if sec < 30 and sec % 2 == 0:                    # a ball hit every 2 s, then silence
+                m.trigger(m.note(57, "GLASS", 5, 2.0), 0.3)
+            acc = 0.0
+            for _ in range(SAMPLE_RATE // BLOCK):
+                pcm = array("h", m.render())
+                acc += sum(x * x for x in pcm) / len(pcm)
+            loud.append(math.sqrt(acc / (SAMPLE_RATE // BLOCK)) / 32768)
+        self.assertLess(max(loud[:30]), 0.3)                 # never pinned near full scale
+        self.assertLess(loud[-1], 0.25 * loud[29])           # source stopped: the echo dies away
+        self.assertLessEqual(max(map(abs, m.cloud.history)), 1.0)
 
     def test_pad_level_scales_ring_tones_and_mutes(self):
         m = Mixer()
@@ -354,6 +364,288 @@ class PixelTest(unittest.TestCase):
                 self.assertEqual(len(re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", line)), cols)
 
 
+class ResonatorTest(unittest.TestCase):
+    @staticmethod
+    def mag(x, f, start=2205, n=4410):
+        seg = x[start:start + n]
+        re_ = sum(v * math.cos(2 * math.pi * f * i / SAMPLE_RATE) for i, v in enumerate(seg))
+        im = sum(v * math.sin(2 * math.pi * f * i / SAMPLE_RATE) for i, v in enumerate(seg))
+        return math.hypot(re_, im)
+
+    def render(self, model="MODAL", midi=57, structure=0.0, bright=0.6, damp=0.5, pos=0.3, strength=0.75, chord=()):
+        return resonator.render_resonator(midi, model, structure, bright, damp, pos, strength, chord)
+
+    def test_models_are_bounded_and_in_tune(self):
+        from synth import midi_to_freq
+        for model in resonator.MODELS:
+            for midi in (45, 69, 81):
+                x = self.render(model, midi)
+                self.assertLessEqual(max(map(abs, x)), 0.91, (model, midi))
+                f0 = midi_to_freq(midi)
+                best = max((f0 * 2 ** (c / 1200) for c in range(-50, 51, 5)), key=lambda f: self.mag(x, f))
+                self.assertLess(abs(1200 * math.log2(best / f0)), 12, (model, midi))   # within ~a tenth of a semitone
+
+    def test_damping_sets_ring_time(self):
+        short, long_ = self.render(damp=0.2), self.render(damp=0.8)
+        self.assertGreater(len(long_), 3 * len(short))
+        tail = lambda x: max(map(abs, x[int(0.4 * SAMPLE_RATE):int(0.5 * SAMPLE_RATE)]), default=0)
+        self.assertLess(tail(short), 0.5 * tail(long_))
+
+    def test_centre_strike_cancels_even_harmonics(self):
+        from synth import midi_to_freq
+        f = midi_to_freq(57)
+        end, centre = self.render(pos=0.0, bright=0.8), self.render(pos=1.0, bright=0.8)
+        self.assertGreater(self.mag(end, 2 * f) / self.mag(end, f), 0.3)
+        self.assertLess(self.mag(centre, 2 * f) / self.mag(centre, f), 0.02)
+
+    def test_brightness_moves_energy_up(self):
+        from synth import midi_to_freq
+        fs = [midi_to_freq(57) * k for k in range(1, 9)]
+        def centroid(x):
+            m = [self.mag(x, f) for f in fs]
+            return sum(f * v for f, v in zip(fs, m)) / sum(m)
+        for model in ("MODAL", "STRING"):
+            self.assertGreater(centroid(self.render(model, bright=0.9)), 1.5 * centroid(self.render(model, bright=0.1)))
+
+    def test_sympathetic_strings_sound_the_chord(self):
+        from synth import midi_to_freq
+        chord = (45, 52, 57, 61)                                  # A major-ish: C#4 is not in a plain A3 string
+        plain = self.render("STRING", 57, structure=0.8, chord=chord)
+        symp = self.render("SYMPATH", 57, structure=0.8, chord=chord)
+        csharp = midi_to_freq(61)
+        self.assertGreater(self.mag(symp, csharp, start=6615), 4 * self.mag(plain, csharp, start=6615))
+
+    def test_same_hit_renders_identically(self):
+        self.assertEqual(self.render("STRING"), self.render("STRING"))
+
+
+class ChokeTest(unittest.TestCase):
+    def test_poly_one_chokes_the_previous_ring_without_a_click(self):
+        m = Mixer()
+        m.wet, m.cloud.level = 0.0, 0.0
+        long_note = resonator.render_resonator(57, "MODAL", 0.0, 0.6, 0.9, 0.3, 0.75)
+        m.trigger(long_note, 0.5, group="balls", poly=1)
+        for _ in range(10):
+            m.render()
+        m.trigger(long_note, 0.5, group="balls", poly=1)
+        pcm = []
+        for _ in range(6):
+            pcm += array("h", m.render())
+        self.assertEqual(sum(1 for v in m.voices if v[3] == "balls"), 1)   # the old ring is gone
+        jumps = max(abs(pcm[i + 1] - pcm[i]) for i in range(len(pcm) - 1))
+        self.assertLess(jumps, 6000)
+
+    def test_poly_four_lets_four_ring(self):
+        m = Mixer()
+        note = resonator.render_resonator(57, "MODAL", 0.0, 0.6, 0.9, 0.3, 0.75)
+        for _ in range(6):
+            m.trigger(note, 0.2, group="balls", poly=4)
+        ringing = [v for v in m.voices if v[3] == "balls" and v[4] is None]
+        self.assertEqual(len(ringing), 4)
+
+
+class ResonatorEngineTest(unittest.TestCase):
+    def test_rings_instrument_routes_hits_through_the_resonator(self):
+        e = app.Engine(app.make_params(), pool=resonator.RenderPool(inline=True))
+        e.params["instr"].index = e.params["instr"].values.index("RINGS")
+        e.apply()
+        from physics import Hit
+        e.world.step = lambda dt: [Hit(0, 0, 2.0, 0)]
+        e.step(1 / 120)
+        self.assertTrue(e.pool.done)
+        self.assertEqual(e.mixer.voices[-1][3], "balls")
+
+    def test_pool_renders_in_another_process_and_falls_back_meanwhile(self):
+        pool = resonator.RenderPool(workers=1)
+        try:
+            args = (57, "STRING", 0.0, 0.6, 0.5, 0.3, 0.75, ())
+            self.assertIsNone(pool.get(args))                    # first render still running: no stall
+            deadline = time.time() + 30
+            while args not in pool.done and time.time() < deadline:
+                time.sleep(0.05)
+            self.assertEqual(list(pool.get(args)), list(resonator.render_resonator(*args)))
+            newer = (57, "STRING", 0.0, 0.6, 0.9, 0.3, 0.75, ())    # DAMPING changed
+            self.assertEqual(list(pool.get(newer)), list(pool.done[args]))   # old sound meanwhile
+        finally:
+            pool.close()
+
+    def test_balls_page_swaps_in_resonator_knobs(self):
+        ps = app.make_params()
+        e = app.Engine(ps)
+        menu = app.Menu(ps)
+        for _ in range(7):
+            app.handle_key("right", e, menu)                      # cursor far along the normal page
+        keys = [p.key for p in menu.items()]
+        self.assertIn("attack", keys)
+        self.assertNotIn("rmodel", keys)
+        e.params["instr"].index = e.params["instr"].values.index("RINGS")
+        keys = [p.key for p in menu.items()]
+        for k in ("rmodel", "rstruct", "rbright", "rdamp", "rpos", "rpoly"):
+            self.assertIn(k, keys)
+        self.assertNotIn("attack", keys)
+        menu.selected()                                           # cursor stays valid after the swap
+        frame = ui.render(app.ui_state(e, menu), 140, 40)
+        for label in ("MODEL", "STRUCTURE", "BRIGHTNESS", "DAMPING", "POLY"):
+            self.assertIn(label, frame)
+
+
+class MarblesTest(unittest.TestCase):
+    def seq(self, **kw):
+        return ChordSequencer(rng=random.Random(kw.pop("seed", 1)), **kw)
+
+    def test_deja_vu_modes(self):
+        new = self.seq(deja=0.0)
+        start = list(new.loop)
+        out = [new.next() for _ in range(64)]
+        self.assertNotEqual(new.loop, start)                       # 0%: keeps rewriting
+        locked = self.seq(deja=0.5)
+        out = [locked.next() for _ in range(64)]
+        self.assertTrue(all(out[i] == out[i + 8] for i in range(56)))   # 50%: one loop, forever
+        shuffled = self.seq(deja=0.9)
+        start = list(shuffled.loop)
+        out = [shuffled.next() for _ in range(64)]
+        self.assertEqual(shuffled.loop, start)                     # >50%: never rewritten ...
+        self.assertTrue(set(out) <= set(start))
+        self.assertFalse(all(out[i] == out[i + 8] for i in range(56)))  # ... but reordered
+
+    def test_partial_deja_vu_drifts_slowly(self):
+        q = self.seq(deja=0.4)                                     # replays 80% of steps
+        start = list(q.loop)
+        for _ in range(8):
+            q.next()
+        changed = sum(a != b for a, b in zip(start, q.loop))
+        self.assertLessEqual(changed, 4)
+
+    def test_spread_and_bias(self):
+        def moves(spread):
+            q = self.seq(deja=0.0, spread=spread, seed=2)
+            prev, out = q.current, []
+            for _ in range(400):
+                d = q.next()
+                out.append(min((d - prev) % 7, (prev - d) % 7))
+                prev = d
+            return out
+        narrow, wide = moves(0.0), moves(1.0)
+        self.assertGreater(narrow.count(1), 0.7 * len(narrow))
+        self.assertGreater(wide.count(2) + wide.count(3), 3 * (narrow.count(2) + narrow.count(3)))
+        def stable_share(bias):
+            q = self.seq(deja=0.0, spread=0.7, bias=bias, seed=3)
+            return sum(q.next() in STABLE for _ in range(400)) / 400
+        self.assertGreater(stable_share(1.0), 0.75)
+        self.assertLess(stable_share(0.0), 0.4)
+
+    def test_regenerate_and_resize(self):
+        q = self.seq(length=8)
+        old = list(q.loop)
+        q.regenerate()
+        self.assertEqual(q.loop[0], 0)                             # a new loop starts on the tonic
+        self.assertNotEqual(q.loop, old)
+        self.assertTrue(all(q.is_fresh(i) for i in range(8)))
+        q.set_length(12)
+        self.assertEqual(len(q.loop), 12)
+        q.set_length(3)
+        self.assertEqual(len(q.loop), 3)
+        self.assertLess(q.pos, 3)
+
+
+class ChordClockTest(unittest.TestCase):
+    def engine(self, **kw):
+        e = app.Engine(app.make_params())
+        settings = {"chord": "MARBLES", "deja": 0, "balls": 1, "grav": 0, **kw}
+        for k, v in settings.items():
+            e.params[k].index = e.params[k].values.index(v)
+        e.apply()
+        e.rng.seed(4)
+        return e
+
+    def run_for(self, e, seconds):
+        changes = 0
+        for _ in range(int(seconds * 120)):
+            before = e.sequencer.steps + e.chord_step
+            e.step(1 / 120)
+            changes += e.sequencer.steps + e.chord_step - before
+        return changes
+
+    def test_top_angle_is_the_loudest_point(self):
+        r = Rings()
+        for tilt in (0.0, 0.2, 0.5):
+            r.tilt = tilt
+            self.assertAlmostEqual(r.moon_level(0, r.top_angle()), 1.0, places=6)
+
+    def test_moon_clock_ticks_once_per_outer_moon_pass(self):
+        e = self.engine(clock="MOON", rings=2, moons=1, speed=100, ratio="SYNC")
+        omega = e.rings.omega(1)                                   # outer ring
+        expected = 30 * omega / TAU
+        self.assertLessEqual(abs(self.run_for(e, 30) - expected), 1.0)
+
+    def test_time_clock_with_jitter(self):
+        e = self.engine(clock="TIME", change=2, jitter=0)
+        self.assertEqual(self.run_for(e, 20.01), 10)
+        e = self.engine(clock="TIME", change=2, jitter=100)
+        intervals = [e._time_interval() for _ in range(200)]
+        self.assertGreater(max(intervals) - min(intervals), 2.0)   # varied ...
+        self.assertTrue(all(0.4 <= i <= 3.6 for i in intervals))   # ... within +-75%
+
+    def test_chance_is_a_coin_toss(self):
+        self.assertEqual(self.run_for(self.engine(clock="TIME", change=2, chance=0), 40), 0)
+        half = self.run_for(self.engine(clock="TIME", change=2, chance=50), 400)
+        self.assertTrue(60 <= half <= 140, half)                  # ~100 of 200 ticks
+
+    def test_hold_freezes_and_g_regenerates(self):
+        e = self.engine(clock="TIME", change=2)
+        menu = app.Menu(list(e.params.values()))
+        app.handle_key("hold", e, menu)
+        self.assertEqual(self.run_for(e, 10), 0)
+        app.handle_key("hold", e, menu)
+        self.assertGreater(self.run_for(e, 10), 0)
+        old = list(e.sequencer.loop)
+        app.handle_key("regenerate", e, menu)
+        self.assertNotEqual(e.sequencer.loop, old)
+        self.assertEqual(app.parse_keys(b"gx"), ["regenerate", "hold"])
+
+    def test_digits_on_chords_page_hold_a_degree(self):
+        ps = app.make_params()
+        e = app.Engine(ps)
+        menu = app.Menu(ps)
+        while menu.page != "CHORDS":
+            menu.next_page()
+        app.handle_key(("digit", 4), e, menu)
+        self.assertEqual(e.v("chord"), "IV")
+
+    def test_chords_page_shows_the_loop(self):
+        e = self.engine(clock="TIME", change=2)
+        menu = app.Menu(list(e.params.values()))
+        while menu.page != "CHORDS":
+            menu.next_page()
+        self.run_for(e, 5)
+        for cols, rows in ((140, 40), (150, 5)):
+            frame = ui.render(app.ui_state(e, menu), cols, rows)
+            self.assertIn("LOOP", frame, cols)
+            self.assertIn(ui.SELECT, frame)                        # the playing chord is lit
+
+
+class AudioTest(unittest.TestCase):
+    def test_mixer_error_is_logged_and_audio_keeps_going(self):
+        import audio
+        with tempfile.TemporaryDirectory() as d:
+            audio.ERROR_LOG = os.path.join(d, "errors.log")
+            m = Mixer()
+            calls = []
+            def flaky(n=BLOCK):
+                calls.append(1)
+                if len(calls) == 3:
+                    raise IndexError("boom")
+                return bytes(2 * n)
+            m.render = flaky
+            out = audio.Output(m, None)
+            blocks = [out._render() for _ in range(6)]
+            self.assertEqual(len(calls), 6)                        # kept rendering after the error
+            self.assertTrue(all(len(b) == 2 * BLOCK for b in blocks))
+            self.assertIn("audio error: IndexError", out.error)
+            with open(audio.ERROR_LOG) as f:
+                self.assertIn("IndexError: boom", f.read())
+
+
 class BehindTest(unittest.TestCase):
     def test_put_words_keeps_text_and_leaves_gaps_open(self):
         placed = []
@@ -480,7 +772,7 @@ class AppTest(unittest.TestCase):
         from physics import Hit
         e = app.Engine(app.make_params())
         gains = []
-        e.mixer.trigger = lambda buf, g: gains.append(g)
+        e.mixer.trigger = lambda buf, g, **_: gains.append(g)
         e.world.step = lambda dt, s=iter((0.3, 3.0)): [Hit(0, 0, next(s), 0)]
         e.step(1 / 120)
         e.step(1 / 120)
@@ -524,6 +816,7 @@ class AppTest(unittest.TestCase):
         self.assertEqual(e.chord(e.chord_step), first)       # held: never moves by itself
         e.params["chord"].index = e.params["chord"].values.index("I-IV-V-I")
         e.params["change"].index = e.params["change"].values.index(2)
+        e.params["clock"].index = e.params["clock"].values.index("TIME")
         e.apply()
         for _ in range(120 * 5):
             e.step(1 / 120)
@@ -555,8 +848,10 @@ class AppTest(unittest.TestCase):
         app.handle_key("up", e, menu)
         self.assertEqual(e.rings.count, 4)
         app.handle_key("page", e, menu)
+        self.assertEqual(menu.page, "CHORDS")
+        app.handle_key("page", e, menu)
         self.assertEqual(menu.page, "GRAINS")
-        app.handle_key("page", e, menu)                     # three pages, then back round
+        app.handle_key("page", e, menu)                     # four pages, then back round
         self.assertIs(menu.selected(), balls_sel)
         self.assertEqual(app.parse_keys(b"\t"), ["page"])
 
@@ -683,7 +978,7 @@ class AppTest(unittest.TestCase):
 
     def test_parse_keys(self):
         self.assertEqual(app.parse_keys(b"\x1b[C\x1b[Akq x"),
-                         ["right", "up", "up", "quit", "toggle"])
+                         ["right", "up", "up", "quit", "toggle", "hold"])
 
     def test_render_frame_both_pages(self):
         ps = app.make_params()
@@ -692,7 +987,8 @@ class AppTest(unittest.TestCase):
         visual = e.params["visual"]
         octants = set(ui.OCTANT[1:]) - {"█"}
         page_labels = {"BALLS": ("GRAV", "BOUNCE", "SHAPE"), "RINGS": ("RINGS", "MOONS", "SPEED", "PAD", "FLOOR"),
-                       "GRAINS": ("DENSITY", "SIZE", "POSITION", "TEXTURE", "FEEDBACK", "SOURCE")}
+                       "GRAINS": ("DENSITY", "SIZE", "POSITION", "TEXTURE", "FEEDBACK", "SOURCE"),
+                       "CHORDS": ("CLOCK", "CHANCE", "LENGTH", "DEJA VU", "BIAS")}
         for mode, is_glyph in (("PIXEL", lambda c: c in "▀▄█"),
                                ("BEHIND", lambda c: c in "▀▄█"),
                                ("BLOCK", lambda c: c in octants),
@@ -703,11 +999,11 @@ class AppTest(unittest.TestCase):
                 for cols, rows in ((120, 40), (60, 16)):
                     frame = ui.render(app.ui_state(e, menu), cols, rows)
                     self.assertTrue(any(map(is_glyph, frame)), mode)
-                    for label in ("SCALE", "BALLS", "RINGS", *page_labels[page]):
+                    for label in ("SCALE", page, *page_labels[page]):
                         self.assertIn(label, frame, (page, cols))
-                    if cols >= 100:                            # narrow strips drop the title first
-                        self.assertIn("HITS", frame)
-                        self.assertIn("TOMBOLA", frame)
+                    if cols >= 100:                            # narrow strips drop the title, then other tabs
+                        for label in ("HITS", "TOMBOLA", *menu.pages):
+                            self.assertIn(label, frame)
                     # every cursor-positioned segment must end inside the terminal
                     for col, text in re.findall(r"\x1b\[\d+;(\d+)H((?:(?!\x1b\[\d+;\d+H).)*)", frame):
                         visible = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text)
@@ -818,7 +1114,7 @@ class AppTest(unittest.TestCase):
         self.assertEqual(app.parse_keys(b"3s8ncI"),
                          [("digit", 3), ("shape", 1), ("digit", 8),
                           ("key", 1), ("scale", 1), ("instr", -1)])
-        shapes = app.make_params()[5].values
+        shapes = next(p for p in app.make_params() if p.key == "shape").values
         self.assertEqual(shapes[0], "TRI")
         self.assertEqual(shapes[5], "OCT")
 
