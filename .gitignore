@@ -8,3 +8,6 @@ play.conf
 
 # Python bytecode
 __pycache__/
+
+# Built audio core (make -C native)
+tombola/libtombola_core.so

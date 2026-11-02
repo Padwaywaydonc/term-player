@@ -11,13 +11,14 @@ def main():
     ap.add_argument("--audio", choices=("wsl", "native", "none"), default="native")
     ap.add_argument("--mpv", default="", help="Windows mpv.exe (used with --audio wsl)")
     ap.add_argument("--linux-mpv", default="")
-    ap.add_argument("--sink", default="", help="custom command that plays mono s16le 22050 Hz PCM from stdin")
+    ap.add_argument("--sink", default="", help="custom command that plays s16le PCM from stdin "
+                    "(48 kHz stereo with the native core, 22.05 kHz mono with the Python engine)")
     ap.add_argument("--config", default=app.CONFIG)
     args = ap.parse_args()
     if not sys.stdin.isatty():
         sys.exit("play --tombola needs an interactive terminal")
-    argv = sink_command(args.audio, args.mpv, args.linux_mpv, args.sink)
-    app.run(lambda mixer: Output(mixer, argv), args.config)
+    app.run(lambda mixer: Output(mixer, sink_command(args.audio, args.mpv, args.linux_mpv, args.sink,
+                                                     mixer.sample_rate, mixer.channels)), args.config)
 
 
 if __name__ == "__main__":

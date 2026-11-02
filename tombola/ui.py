@@ -290,7 +290,8 @@ def _title(state, width):
 
 def _status(state):
     on = f"{SELECT} ON {RESET}" if state["on"] else f"{fg(DIM)} OFF {RESET}"
-    return f"{fg(DIM)}DSP {RESET}{fg(AMBER)}{min(99, int(state['dsp'] * 100)):2d}%{RESET} {on}"
+    engine = {"native": "48K", "python": "PY"}.get(state.get("engine"), "")    # which audio engine runs
+    return f"{fg(DIM)}{engine} DSP {RESET}{fg(AMBER)}{min(99, int(state['dsp'] * 100)):2d}%{RESET} {on}"
 
 
 def _flow(params, sel, width):

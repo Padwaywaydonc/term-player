@@ -1,4 +1,7 @@
-"""Resonator voice for ball hits, modelled on Mutable Instruments Rings.
+"""Resonator voice for ball hits — the Python fallback engine's version.
+
+The native core (libtombola_core.so) uses Emilie Gillet's open-source resonator
+instead (see NOTICE); this simplified one keeps RESONATOR working without it.
 
 Each hit is a strum: a short exciter (pulse or filtered noise burst, brighter for
 harder hits) sets a resonating structure ringing.

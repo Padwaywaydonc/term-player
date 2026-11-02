@@ -13,7 +13,9 @@ import tty
 
 from music import SHAPES, pad_note
 from marbles import ChordSequencer
-from params import (CONFIG, DEGREES, HISTORY_MAX, MARBLES, PAGES, PROGRESSIONS, RANDOM_RANGES,  # noqa: F401
+import native
+from params import (CONFIG, DEGREES, HISTORY_MAX, PAGES, PROGRESSIONS, RANDOM, RANDOM_RANGES,  # noqa: F401
+                    RESONATOR, RESONATOR_MODELS,
                     apply_snapshot, load_history, load_params, make_params, page_params, save_params,
                     snapshot)
 from physics import BALL_SIZES, World
@@ -24,6 +26,17 @@ from synth import Mixer
 import ui
 
 PHYS_DT = 1 / 120
+PY_MODEL = {"MODAL": "MODAL", "SYMPATH": "SYMPATH", "STRING": "STRING",       # Python fallback stand-ins
+            "FM": "MODAL", "SYMP-Q": "SYMPATH", "STR+REV": "STRING"}
+
+
+def make_mixer():
+    """The native 48 kHz core when it's built (and TOMBOLA_ENGINE isn't 'python'), else Python."""
+    if os.environ.get("TOMBOLA_ENGINE") != "python":
+        lib = native.load()
+        if lib:
+            return native.NativeMixer(lib)
+    return Mixer()
 FRAME_DT = 1 / 30
 PAD_LOWEST = 40                  # E2 (~82 Hz): the pad's bass never goes below this
 PREWARM_KEYS = {"key", "scale", "instr", "attack", "release", "octave", "shape",
@@ -36,6 +49,7 @@ class Engine:
 
     def __init__(self, params, mixer=None, pool=None):
         self.params = {p.key: p for p in params}
+        mixer = mixer or make_mixer()
         self._pool = pool                        # resonator renders; started on first RINGS use
         self.world = World()
         self.rings = Rings()
@@ -77,6 +91,11 @@ class Engine:
         self.mixer.grain_source = self.v("source")
         self.mixer.bed = self.v("bed") / 100 * 0.45 * self.ring_vol() if self.on else 0.0
         self.mixer.ring_timbre = self.v("tone")
+        c.mode = self.v("gmode")
+        if self.native:
+            self.mixer.res.update(model=RESONATOR_MODELS.index(self.v("rmodel")), poly=self.v("rpoly"),
+                                  structure=self.v("rstruct") / 100, brightness=self.v("rbright") / 100,
+                                  damping=self.v("rdamp") / 100, position=self.v("rpos") / 100)
         q = self.sequencer
         q.deja, q.spread, q.bias = self.v("deja") / 100, self.v("cspread") / 100, self.v("cbias") / 100
         if q.length != self.v("length"):
@@ -96,7 +115,7 @@ class Engine:
         """[bass, root, third, fifth] of the current chord.
 
         CHORD is a held scale degree (I..VII), a progression (step counts its
-        moves) or MARBLES, the random loop's current chord; the CHORDS page sets
+        moves) or RANDOM, the random loop's current chord; the CHORDS page sets
         when moving chords move.
 
         0 on the rings' OCTAVE is the lowest voicing whose bass is at least
@@ -107,7 +126,7 @@ class Engine:
         name = self.v("chord")
         if name in DEGREES:
             degree = DEGREES.index(name)
-        elif name == MARBLES:
+        elif name == RANDOM:
             degree = self.sequencer.current
         else:
             prog = PROGRESSIONS[name]
@@ -155,7 +174,7 @@ class Engine:
 
     def resonator_args(self, midi, strength):
         """Arguments for render_resonator: the hit's note, the resonator settings, the ring chord."""
-        model = self.v("rmodel")
+        model = PY_MODEL.get(self.v("rmodel"), "MODAL")       # the Python fallback has three
         chord = tuple(self.chord(self.chord_step)) if model == "SYMPATH" else ()
         return (midi, model, self.v("rstruct") / 100, self.v("rbright") / 100, self.v("rdamp") / 100,
                 self.v("rpos") / 100, strength_step(strength), chord)
@@ -170,9 +189,13 @@ class Engine:
         if self._pool:
             self._pool.close()
 
+    @property
+    def native(self):
+        return isinstance(self.mixer, native.NativeMixer)
+
     def ball_sound(self, edge, ball_octave, strength=0.75):
-        """The hit's buffer; with RINGS possibly None for a moment after a setting change."""
-        if self.v("instr") == "RINGS":
+        """The hit's buffer; with RESONATOR possibly None for a moment after a setting change."""
+        if self.v("instr") == RESONATOR:
             midi = pad_note(self.v("key"), self.v("scale"), edge, self.v("octave"), ball_octave)
             return self.pool.get(self.resonator_args(midi, strength))
         return self.mixer.note(*self.note_args(edge, ball_octave))
@@ -184,8 +207,11 @@ class Engine:
         a key down costs one render pass, not a thread per key repeat.
         """
         jobs = [(e, o, s) for e in range(self.world.sides) for _, o in BALL_SIZES
-                for s in (STRENGTHS if self.v("instr") == "RINGS" else (0.75,))]
-        if self.v("instr") == "RINGS":               # the pool renders in other processes
+                for s in (STRENGTHS if self.v("instr") == RESONATOR else (0.75,))]
+        if self.v("instr") == RESONATOR:
+            if self.native:                          # the native core resonates in real time
+                return
+            # the Python fallback renders resonator hits in other processes
             for e, o, s in jobs:
                 midi = pad_note(self.v("key"), self.v("scale"), e, self.v("octave"), o)
                 self.pool.request(self.resonator_args(midi, s))
@@ -208,10 +234,15 @@ class Engine:
     def step(self, dt):
         for hit in self.world.step(dt):
             strength = min(1.0, 0.08 + hit.speed / 2.0)               # hard hits louder (and brighter)
+            if self.native and self.v("instr") == RESONATOR:
+                midi = pad_note(self.v("key"), self.v("scale"), hit.edge, self.v("octave"), hit.octave)
+                self.mixer.strike(midi, strength * self.ball_vol())
+                self.hits += 1
+                continue
             buf = self.ball_sound(hit.edge, hit.octave, strength)
             if buf is None:                          # first-ever render of this note still running
                 continue
-            poly = self.v("rpoly") if self.v("instr") == "RINGS" else None
+            poly = self.v("rpoly") if self.v("instr") == RESONATOR else None
             self.mixer.trigger(buf, 0.4 * strength * self.ball_vol(), group="balls", poly=poly)
             self.hits += 1
         before = self.outer_moons()
@@ -221,7 +252,7 @@ class Engine:
         self.mixer.set_rings(self.ring_targets())
 
     def moving(self):
-        return self.v("chord") in PROGRESSIONS or self.v("chord") == MARBLES
+        return self.v("chord") in PROGRESSIONS or self.v("chord") == RANDOM
 
     def outer_moons(self):
         k = self.rings.count - 1
@@ -249,7 +280,7 @@ class Engine:
         return self.v("change") * (1 + 0.75 * self.v("jitter") / 100 * self.rng.uniform(-1, 1))
 
     def advance_chord(self):
-        if self.v("chord") == MARBLES:
+        if self.v("chord") == RANDOM:
             self.sequencer.next()
         else:
             self.chord_step += 1
@@ -435,7 +466,7 @@ def sync_window(window, engine, fx, now=None):
 def chord_row(engine):
     """(title, [(label, current, fresh)]) for the CHORDS page: the loop, progression or held chord."""
     name = engine.v("chord")
-    if name == MARBLES:
+    if name == RANDOM:
         q = engine.sequencer
         playing = (q.pos - 1) % q.length
         return "LOOP", [(DEGREES[d], i == playing, q.is_fresh(i)) for i, d in enumerate(q.loop)]
@@ -451,7 +482,7 @@ def ui_state(engine, menu, output=None, fx=None, window=None):
             "page": menu.page, "world": engine.world, "rings": engine.rings,
             "bed_level": engine.v("bed") / 100, "hits": engine.hits,
             "dsp": output.dsp if output else 0.0, "on": engine.on,
-            "error": " ".join(e for e in (output.error if output else "",
+            "engine": engine.mixer.name, "error": " ".join(e for e in (output.error if output else "",
                                           window.error if window else "") if e),
             "fx": fx, "window": engine.v("window") == "ON",
             "chords": chord_row(engine) if menu.page == "CHORDS" else None, "hold": engine.hold}

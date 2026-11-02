@@ -88,8 +88,10 @@ grep -q -- '-icanon' "$WORK/stty" && fail "terminal left in cbreak mode after qu
 grep -qx -- '--demuxer-rawaudio-format=s16le' "$WORK/sink.args" 2>/dev/null || fail "sink not started as raw PCM player"
 
 BYTES=$(stat -c %s "$WORK/sink.pcm" 2>/dev/null || echo 0)
-# ~6 s at 22050 Hz s16 mono ≈ 264 kB; paced output must be near real time, not a burst.
-[ "$BYTES" -gt 150000 ] && [ "$BYTES" -lt 600000 ] || fail "unexpected PCM size: $BYTES bytes"
+RATE=$(sed -n 's/^--demuxer-rawaudio-rate=//p' "$WORK/sink.args"); CH=$(sed -n 's/^--demuxer-rawaudio-channels=//p' "$WORK/sink.args")
+SECS=$(( BYTES / (${RATE:-22050} * ${CH:-1} * 2) ))
+# ~6-7 s of run time: paced output must be near real time, not a burst (any engine format).
+[ "$SECS" -ge 4 ] && [ "$SECS" -le 10 ] || fail "unexpected PCM length: $SECS s ($BYTES bytes at ${RATE}Hz x$CH)"
 PEAK=$(python3 -c "
 import sys
 from array import array
@@ -101,5 +103,5 @@ grep -q '"grav": 40' "$WORK/home/.config/play-tombola.json" 2>/dev/null || fail 
 grep -q '"shape": "TRI"' "$WORK/home/.config/play-tombola.json" 2>/dev/null || fail "shape hotkey not persisted"
 grep -q '"rings": 4' "$WORK/home/.config/play-tombola.json" 2>/dev/null || fail "RINGS change not persisted"
 
-[ $FAIL -eq 0 ] && echo "PASS: tombola e2e (pcm=${BYTES}B peak=$PEAK)"
+[ $FAIL -eq 0 ] && echo "PASS: tombola e2e (pcm=${SECS}s at ${RATE}Hz x$CH, peak=$PEAK)"
 exit $FAIL

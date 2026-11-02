@@ -13,11 +13,13 @@ import tempfile
 import unittest
 from array import array
 
+os.environ["TOMBOLA_ENGINE"] = "python"    # these tests exercise the Python engine; native tests opt in
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tombola"))
 
 import app  # noqa: E402
 import backdrop  # noqa: E402
 import pixels  # noqa: E402
+import native  # noqa: E402
 from marbles import STABLE, ChordSequencer  # noqa: E402
 import resonator  # noqa: E402
 import ui  # noqa: E402
@@ -447,7 +449,7 @@ class ChokeTest(unittest.TestCase):
 class ResonatorEngineTest(unittest.TestCase):
     def test_rings_instrument_routes_hits_through_the_resonator(self):
         e = app.Engine(app.make_params(), pool=resonator.RenderPool(inline=True))
-        e.params["instr"].index = e.params["instr"].values.index("RINGS")
+        e.params["instr"].index = e.params["instr"].values.index("RESONATOR")
         e.apply()
         from physics import Hit
         e.world.step = lambda dt: [Hit(0, 0, 2.0, 0)]
@@ -478,7 +480,7 @@ class ResonatorEngineTest(unittest.TestCase):
         keys = [p.key for p in menu.items()]
         self.assertIn("attack", keys)
         self.assertNotIn("rmodel", keys)
-        e.params["instr"].index = e.params["instr"].values.index("RINGS")
+        e.params["instr"].index = e.params["instr"].values.index("RESONATOR")
         keys = [p.key for p in menu.items()]
         for k in ("rmodel", "rstruct", "rbright", "rdamp", "rpos", "rpoly"):
             self.assertIn(k, keys)
@@ -551,7 +553,7 @@ class MarblesTest(unittest.TestCase):
 class ChordClockTest(unittest.TestCase):
     def engine(self, **kw):
         e = app.Engine(app.make_params())
-        settings = {"chord": "MARBLES", "deja": 0, "balls": 1, "grav": 0, **kw}
+        settings = {"chord": "RANDOM", "deja": 0, "balls": 1, "grav": 0, **kw}
         for k, v in settings.items():
             e.params[k].index = e.params[k].values.index(v)
         e.apply()
@@ -622,6 +624,122 @@ class ChordClockTest(unittest.TestCase):
             frame = ui.render(app.ui_state(e, menu), cols, rows)
             self.assertIn("LOOP", frame, cols)
             self.assertIn(ui.SELECT, frame)                        # the playing chord is lit
+
+
+LIB = native.load()
+
+
+@unittest.skipUnless(LIB, "native core not built (cd native && make)")
+class NativeCoreTest(unittest.TestCase):
+    SR = native.SAMPLE_RATE
+
+    def mixer(self, **cloud):
+        m = native.NativeMixer(LIB)
+        m.wet, m.cloud.level = 0.0, 0.0
+        for k, v in cloud.items():
+            setattr(m.cloud, k, v)
+        return m
+
+    def run_for(self, m, seconds, each=None):
+        left, right = [], []
+        for b in range(int(seconds * self.SR / native.BLOCK)):
+            if each:
+                each(m, b)
+            pcm = array("h", m.render())
+            left += pcm[0::2]
+            right += pcm[1::2]
+        return left, right
+
+    def mag(self, x, f, start=9600, n=19200):
+        seg = x[start:start + n]
+        return math.hypot(sum(v * math.cos(2 * math.pi * f * i / self.SR) for i, v in enumerate(seg)),
+                          sum(v * math.sin(2 * math.pi * f * i / self.SR) for i, v in enumerate(seg)))
+
+    @staticmethod
+    def rms(x):
+        return math.sqrt(sum(v * v for v in x) / max(1, len(x)))
+
+    def test_every_resonator_model_rings_in_tune_and_in_stereo(self):
+        for model in range(len(app.RESONATOR_MODELS)):
+            m = self.mixer()
+            m.res.update(model=model, poly=4)
+            m.strike(57, 1.0)
+            left, right = self.run_for(m, 1.0)
+            mono = [a + b for a, b in zip(left, right)]
+            self.assertGreater(self.mag(mono, 220.0), 5 * self.mag(mono, 220.0 * 2 ** (-1 / 12)), model)
+            self.assertGreater(self.rms([a - b for a, b in zip(left, right)]), 0.2 * self.rms(left), model)
+
+    def test_harder_strikes_are_louder(self):
+        soft, hard = self.mixer(), self.mixer()
+        soft.strike(57, 0.2)
+        hard.strike(57, 1.0)
+        self.assertGreater(self.rms(self.run_for(hard, 0.3)[0]), 3 * self.rms(self.run_for(soft, 0.3)[0]))
+
+    def test_engine_strikes_the_resonator_in_real_time(self):
+        e = app.Engine(app.make_params(), mixer=native.NativeMixer(LIB))
+        e.params["instr"].index = e.params["instr"].values.index("RESONATOR")
+        e.params["rmodel"].index = e.params["rmodel"].values.index("STRING")
+        e.apply()
+        self.assertEqual(e.mixer.res["model"], app.RESONATOR_MODELS.index("STRING"))
+        from physics import Hit
+        struck = []
+        e.mixer.strike = lambda midi, strength: struck.append((midi, strength))
+        e.world.step = lambda dt: [Hit(0, 0, 2.0, 0)]
+        e.step(1 / 120)
+        self.assertEqual(len(struck), 1)
+        self.assertEqual(e.hits, 1)
+
+    def test_ring_chord_and_grains_sound(self):
+        m = self.mixer()
+        m.bed = 0.4
+        m.set_rings([(57, 1.0), (64, 1.0)])
+        self.assertGreater(self.rms(self.run_for(m, 0.5)[0][12000:]), 300)
+
+        def chord(level, freeze_at=None):
+            g = self.mixer(level=level, density=0.5, size=0.2, position=0.3)
+            g.grain_source, g.bed = "RINGS", 0.4
+
+            def each(mm, b):
+                t = b * native.BLOCK / self.SR
+                mm.set_rings([(57, 1.0 if t < 3 else 0.0)])
+                if freeze_at is not None and t >= freeze_at:
+                    mm.cloud.freeze = True
+            return self.run_for(g, 6, each)[0]
+        dry, wet, frozen = chord(0.0), chord(1.0), chord(1.0, freeze_at=2.5)
+        self.assertGreater(self.rms(wet[48000:144000]), 1.2 * self.rms(dry[48000:144000]))
+        self.assertLess(self.rms(wet[200000:]), 50)            # source gone, not frozen: fades
+        self.assertGreater(self.rms(frozen[200000:]), 300)      # frozen: keeps granulating
+
+    def test_feedback_at_maximum_dies_away(self):
+        m = self.mixer(level=1.0, density=0.8, size=0.4, feedback=1.0)
+        m.grain_source, m.bed = "RINGS", 0.5
+        left = self.run_for(m, 20, lambda mm, b: mm.set_rings(
+            [(57, 1.0 if b * native.BLOCK / self.SR < 5 else 0.0)]))[0]
+        self.assertLess(self.rms(left[-96000:]), 200)
+
+    def test_all_grain_modes_play(self):
+        for mode in native.GRAIN_MODES:
+            m = self.mixer(level=1.0, density=0.7, size=0.2, mode=mode)
+            m.grain_source, m.bed = "RINGS", 0.4
+            left = self.run_for(m, 2, lambda mm, b: mm.set_rings([(57, 1.0)]))[0]
+            self.assertGreater(self.rms(left[48000:]), 100, mode)
+
+    def test_renders_far_faster_than_real_time(self):
+        m = self.mixer(level=1.0, density=0.8, size=0.4)
+        m.bed, m.wet = 0.5, 0.5
+        m.set_rings([(45, 1), (52, 1), (57, 1), (61, 1)])
+        start = time.perf_counter()
+        self.run_for(m, 5, lambda mm, b: mm.strike(57 + b % 12, 0.8) if b % 20 == 0 else None)
+        self.assertLess(time.perf_counter() - start, 1.5)        # 5 s of audio, typically ~0.15 s
+
+    def test_python_engine_can_be_forced(self):
+        self.assertEqual(os.environ.get("TOMBOLA_ENGINE"), "python")
+        self.assertEqual(app.make_mixer().name, "python")
+        os.environ.pop("TOMBOLA_ENGINE")
+        try:
+            self.assertEqual(app.make_mixer().name, "native")
+        finally:
+            os.environ["TOMBOLA_ENGINE"] = "python"
 
 
 class AudioTest(unittest.TestCase):
@@ -707,7 +825,7 @@ class BackdropTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             out = os.path.join(d, "frames.txt")
             w = backdrop.Backdrop()
-            w.proc = subprocess.Popen(["sh", "-c", f"cat > {out}"], stdin=subprocess.PIPE, text=True)
+            w.proc = subprocess.Popen(["sh", "-c", f"cat > {out}"], stdin=subprocess.PIPE, bufsize=0)
             for n in range(5):                               # burst before the sender runs: only #4 survives
                 w.submit([f"S {n} 1", "E"])
             w._thread = threading.Thread(target=w._send_loop, daemon=True)
@@ -969,6 +1087,20 @@ class AppTest(unittest.TestCase):
             vis.index = vis.values.index("BLOCK")                             # user picks BLOCK again
             app.save_params(ps, path)
             self.assertEqual(next(p for p in app.load_params(path) if p.key == "visual").value, "BLOCK")
+
+    def test_old_value_names_migrate(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "cfg.json")
+            with open(path, "w") as f:
+                json.dump({"version": 2, "instr": "RINGS", "chord": "MARBLES", "grav": 15,
+                           "history": [{"instr": "RINGS", "chord": "MARBLES"}]}, f)
+            loaded = {p.key: p.value for p in app.load_params(path)}
+            self.assertEqual((loaded["instr"], loaded["chord"], loaded["grav"]), ("RESONATOR", "RANDOM", 15))
+            e = app.Engine(app.load_params(path))
+            e.history = app.load_history(path)
+            e.params["instr"].index = 0
+            e.undo()                                             # history entries migrate too
+            self.assertEqual((e.v("instr"), e.v("chord")), ("RESONATOR", "RANDOM"))
 
     def test_param_nudge_clamps(self):
         p = next(p for p in app.make_params() if p.key == "octave")

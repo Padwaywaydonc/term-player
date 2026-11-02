@@ -1,4 +1,4 @@
-"""Chord sequencer modelled on Mutable Instruments Marbles' random loop.
+"""Random chord loop with a deja-vu control, after Emilie Gillet's random-loop design.
 
 A loop of LENGTH scale degrees is played step by step. DEJA VU decides how much
 of it is remembered, as on Marbles:

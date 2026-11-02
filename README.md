@@ -104,16 +104,13 @@ Saturn rings:
 - **Balls** fall under gravity inside a spinning polygon. Every edge is a pad
   tuned to a step of the chosen scale; a ball that hits a pad hard enough plays
   it — small balls an octave up, large balls an octave down, harder hits louder.
-  With `INSTR` set to `RINGS` each hit instead strikes a resonator modelled on
-  Mutable Instruments Rings: `MODEL` `MODAL` (tuned partials, `STRUCTURE`
-  morphing string → bar → plate), `STRING` (Karplus-Strong string; `STRUCTURE`
-  adds stiffness for piano-like or inharmonic tones) or `SYMPATH` (the plucked
-  string plus sympathetic strings ringing along on octaves/fifths or the rings'
-  chord), with `BRIGHTNESS` (wood/nylon → glass/steel), `DAMPING` (0.08–10 s),
-  `POSITION` (where the strike lands; the centre cancels even harmonics) and
-  `POLY` (1 voice: each hit chokes the last; up to 4 ring together). Harder
-  hits strike brighter. The hits render in background processes, so changing a
-  setting never interrupts the sound.
+  With `INSTR` set to `RESONATOR` each hit instead strikes a resonator: `MODEL`
+  `MODAL` (tuned modes; `STRUCTURE` morphs string → bar → plate), `SYMPATH`
+  (sympathetic strings), `STRING` (inharmonic / modulated string), `FM`,
+  `SYMP-Q` (sympathetic strings on chord tunings) or `STR+REV` (string with its
+  own reverb), with `BRIGHTNESS` (wood/nylon → glass/steel), `DAMPING`, `POSITION`
+  (where the strike lands; the centre cancels even harmonics) and `POLY` (1, 2 or
+  4 voices). Harder hits strike harder.
 - **Rings** are the chord. They circle the polygon as tilted ellipses (the
   near, lower half passes in front of it, the far half behind). Each ring sounds
   one chord note continuously — `RINGS` sets how many: root, + fifth, + third,
@@ -124,23 +121,27 @@ Saturn rings:
   100% a steady drone). Moons
   grow and glow as they get louder. You choose the chord: `CHORD` holds a scale
   degree (`I`…`VII`, also keys `1`–`7` on the RINGS and CHORDS pages), runs a
-  progression, or `MARBLES` — a random chord loop modelled on Mutable
-  Instruments Marbles (see the CHORDS page below).
-- **Grains** — a granular processor modelled on Mutable Instruments Clouds, on
-  its own `GRAINS` page. It records the balls, the rings or both (`SOURCE`) into a
-  2-second buffer and replays grains from it: `DENSITY` (negative = steady rate,
-  0 = none, positive = random), `SIZE` (20–500 ms), `POSITION` (how far back),
-  `PITCH` (±12 semitones), `SPREAD` (random position, length and in-key pitch
-  jumps), `TEXTURE` (grain window: square → triangle → smooth), `FEEDBACK` (grains
-  re-recorded, soft-limited so it can't run away), `FREEZE` (stop recording and
-  keep granulating the last two seconds; also `f`) and `GRAIN` (level). Each
-  grain shows as a brief spark.
+  progression, or `RANDOM` — a random chord loop (see the CHORDS page below).
+- **Grains** — a granular processor on its own `GRAINS` page. It records the
+  balls, the rings or both (`SOURCE`) and replays grains from it: `MODE`
+  (`GRANULAR`, `STRETCH` time-stretching, `DELAY` looping delay, `SPECTRAL`),
+  `DENSITY` (negative = steady rate, 0 = none, positive = random), `SIZE`,
+  `POSITION` (how far back), `PITCH` (±12 semitones), `SPREAD` (stereo spread),
+  `TEXTURE` (grain window: square → triangle → smooth, then a smearing diffuser),
+  `FEEDBACK` (grains re-recorded; capped so it always dies away), `FREEZE` (stop
+  recording and keep granulating what's in the buffer; also `f`) and `GRAIN`
+  (level). Each grain shows as a brief spark.
 
-Everything is pure Python (no extra packages): instruments `PLUCK`
-(Karplus-Strong), `BELL` (FM), `MARIMBA`, `GLASS`, `PAD`, `KALIMBA`, `VIBES`,
-`ORGAN`, `CHIME`, `SAW` (plus the `RINGS` resonator for the balls), an attack/release
-envelope and a reverb. Mono 22.05 kHz PCM is streamed to Windows `mpv.exe` on
-WSL, or to `pacat` / Linux `mpv` natively. Graphics default to `PIXEL`:
+**Audio engine.** `./install.sh` builds a small native core (`native/`, needs
+`make` and `g++`): 48 kHz stereo, with the resonator, granular processor and
+reverb DSP from Emilie Gillet's open-source eurorack code (MIT — see `NOTICE`),
+plus the ring-chord voices and the mix. If it isn't built, tombola falls back to
+its pure-Python engine (22.05 kHz mono, simplified resonator and grains); the
+status line shows `48K` or `PY`, and `TOMBOLA_ENGINE=python` forces the fallback.
+Ball instruments `PLUCK` (Karplus-Strong), `BELL` (FM), `MARIMBA`, `GLASS`,
+`PAD`, `KALIMBA`, `VIBES`, `ORGAN`, `CHIME`, `SAW` are rendered in Python and
+played by either engine, with an attack/release envelope. Audio goes to Windows
+`mpv.exe` on WSL, or to `pacat` / Linux `mpv` natively. Graphics default to `PIXEL`:
 half-block characters, two square pixels per cell with their own colour, which
 every terminal and font draws as solid blocks. `v` also offers `BEHIND` (the
 same scene, muted, filling the whole pane behind the text), `BLOCK` (octant
@@ -157,8 +158,8 @@ small strip drops its own picture and shows just the controls.
 **CHORDS page — when and how the chord moves.** `CLOCK` `MOON` changes chord each
 time the outer ring's moon passes its highest point (so the harmony moves with
 the orbit you see); `TIME` every `CHANGE` seconds, varied by `JITTER`. `CHANCE`
-is a coin toss on every tick (Mutable Branches): change, or stay. With `CHORD`
-on `MARBLES` the chords come from a loop of `LENGTH` (1–16) steps: `DEJA VU` 0%
+is a coin toss on every tick: change, or stay. With `CHORD`
+on `RANDOM` the chords come from a loop of `LENGTH` (1–16) steps: `DEJA VU` 0%
 draws a new chord every step, up to 50% replays the loop with growing
 probability (it slowly evolves), 50% locks it, above 50% shuffles it. `SPREAD`
 sets how far a new chord may jump, `BIAS` favours colourful (II, III, VII) or
@@ -170,9 +171,9 @@ Settings are split over four pages — `Tab` switches:
 
 | Page    | Settings |
 |---------|----------|
-| `BALLS` | `KEY` `SCALE` `INSTR` `ATTACK` `RELEASE` `SHAPE` `VISUAL` `BALLS` `GRAV` `ROT` `BOUNCE` `OCTAVE` `REVERB` `GRAIN` `VOL` (ball volume); with `INSTR` `RINGS`: `MODEL` `STRUCTURE` `BRIGHTNESS` `DAMPING` `POSITION` `POLY` in place of `ATTACK` `RELEASE` |
+| `BALLS` | `KEY` `SCALE` `INSTR` `ATTACK` `RELEASE` `SHAPE` `VISUAL` `BALLS` `GRAV` `ROT` `BOUNCE` `OCTAVE` `REVERB` `GRAIN` `VOL` (ball volume); with `INSTR` `RESONATOR`: `MODEL` `STRUCTURE` `BRIGHTNESS` `DAMPING` `POSITION` `POLY` in place of `ATTACK` `RELEASE` |
 | `CHORDS` | `KEY` `SCALE` `CHORD` `CLOCK` (`MOON` `TIME`) `VISUAL` `WINDOW` `CHANGE` `JITTER` `CHANCE` `LENGTH` `DEJA VU` `SPREAD` `BIAS` `OCTAVE` |
-| `GRAINS` | `KEY` `SCALE` `SOURCE` (`ALL` `BALLS` `RINGS`) `FREEZE` `VISUAL` `WINDOW` `GRAIN` (level) `DENSITY` `SIZE` `POSITION` `PITCH` `SPREAD` `TEXTURE` `FEEDBACK` `REVERB` |
+| `GRAINS` | `KEY` `SCALE` `SOURCE` (`ALL` `BALLS` `RINGS`) `MODE` `FREEZE` `VISUAL` `WINDOW` `GRAIN` (level) `DENSITY` `SIZE` `POSITION` `PITCH` `SPREAD` `TEXTURE` `FEEDBACK` `REVERB` |
 | `RINGS` | `KEY` `SCALE` `INSTR` (ring timbre: `WARM` `GLASS` `SINE` `ORGAN` `SAW`) `CHORD` (held degree `I`…`VII`, or a progression) `RATIO` (orbit speeds: `KEPLER` outer-slower, `HARM`, `PRIME`, `GOLD`, `SYNC`) `VISUAL` `WINDOW` `RINGS` (chord notes, 0–4) `MOONS` (swells per orbit) `SPEED` `TILT` `OCTAVE` (−3…+3; 0 = lowest clearly audible, below = sub-bass) `PAD` (ring level) `FLOOR` (volume with the moon at its lowest: 0% silent … 100% drone) `REVERB` `GRAIN` `VOL` (ring volume) |
 
 In a full-size pane every setting of the page is a knob along the bottom.
@@ -184,7 +185,7 @@ In a full-size pane every setting of the page is a knob along the bottom.
 | `↑` / `↓`      | change it (also `k` / `j`)                |
 | `3` … `8`      | BALLS page: shape — triangle, square, pentagon … octagon |
 | `1` … `7`      | RINGS / CHORDS page: hold chord I … VII   |
-| `g`            | regenerate the MARBLES chord loop         |
+| `g`            | regenerate the RANDOM chord loop          |
 | `x`            | hold the current chord (no changes)       |
 | `s` / `S`      | next / previous shape                     |
 | `n` / `N`      | next / previous key                       |

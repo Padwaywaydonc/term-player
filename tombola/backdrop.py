@@ -139,7 +139,8 @@ class Backdrop:
             script = _windows_copy(SCRIPT)
             self.proc = subprocess.Popen(
                 ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script],
-                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True)
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                bufsize=0)                       # unbuffered bytes: nothing left to flush at exit
         except (OSError, subprocess.SubprocessError) as exc:
             self.error = f"WINDOW: {exc}"
             return
@@ -160,8 +161,7 @@ class Backdrop:
             if frame is None:
                 continue
             try:
-                proc.stdin.write("\n".join(frame) + "\n")
-                proc.stdin.flush()
+                proc.stdin.write(("\n".join(frame) + "\n").encode())
             except (BrokenPipeError, OSError, ValueError):
                 return
 

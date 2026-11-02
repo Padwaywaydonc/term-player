@@ -269,7 +269,8 @@ def grain_window(length, texture):
 
 
 class GrainCloud:
-    """Granular processor modelled on Mutable Instruments Clouds.
+    """Granular processor for the Python fallback engine (the native core uses Emilie
+    Gillet's open-source granular processor instead, see NOTICE).
 
     Records its source into a 2 s buffer (not while frozen) and replays grains
     from it. density < 0: grains at a steady rate, > 0: at random times, 0: none.
@@ -392,6 +393,8 @@ class Mixer:
     """
 
     SOURCES = ("ALL", "BALLS", "RINGS")
+    sample_rate, channels, block = SAMPLE_RATE, 1, BLOCK
+    name = "python"
 
     def __init__(self):
         self.voices = []           # [samples, pos, gain]
