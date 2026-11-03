@@ -752,6 +752,82 @@ class NativeCoreTest(unittest.TestCase):
         self.assertGreater(loud, 3 * quiet)                      # quieter ...
         self.assertGreater(bright_loud, 1.5 * bright_quiet)      # ... and darker, like a low-pass gate
 
+    def test_drums_play_only_when_on_and_follow_density(self):
+        def level(**drums):
+            m = self.mixer()
+            m.drums.update(**drums)
+            return self.rms(self.run_for(m, 1.0)[0])
+        self.assertEqual(level(play=0), 0)
+        self.assertGreater(level(play=1, density=(0.6, 0.5, 0.7)), 300)
+        self.assertEqual(level(play=1, density=(0.0, 0.0, 0.0)), 0)       # density 0: that part never plays
+
+    def test_drum_map_moves_from_straight_to_busy(self):
+        m = self.mixer()
+        hits = lambda x, y: sum(v > 255 - 0.6 * 255 for part in m.drum_levels(x, y) for v in part)
+        straight = m.drum_levels(0.0, 0.0)
+        self.assertTrue(all(straight[0][s] > 192 for s in (0, 8, 16, 24)))   # four on the floor, accented
+        self.assertTrue(straight[1][8] > 192 and straight[1][24] > 192)     # backbeat
+        self.assertGreater(hits(1.0, 1.0), 2 * hits(0.0, 0.0))
+
+    def test_warp_is_off_at_mix_zero_and_level_matched_when_on(self):
+        def run(**warp):
+            m = self.mixer()
+            m.bed = 0.3
+            m.synth["engine"] = 8
+            m.warp.update(**warp)
+            return self.run_for(m, 1.5, lambda mm, b: (mm.set_rings([(48, .8), (55, .7)]),
+                                                     b % 25 == 0 and mm.synth_hit(60, .8)))[0]
+        dry = run(mix=0.0)
+        self.assertEqual(dry, run(mix=0.0, algo=0.5))                     # bypassed entirely
+        for algo in (0.1, 0.4, 0.6, 0.9):                                # cross-mods ... vocoder
+            wet = run(mix=1.0, algo=algo, drive=0.8)
+            self.assertNotEqual(wet, dry)
+            self.assertLess(abs(math.log(self.rms(wet[36000:]) / self.rms(dry[36000:]))), math.log(3), algo)
+
+    def test_scatter_mode_adds_grains(self):
+        def run(level):
+            m = self.mixer(mode="SCATTER", level=level, density=0.6)
+            m.bed = 0.3
+            return self.rms(self.run_for(m, 2.0, lambda mm, b: mm.set_rings([(57, .8)]))[0][48000:])
+        self.assertGreater(run(1.0), 1.1 * run(0.0))
+
+    def test_mods_sweep_their_targets(self):
+        m = self.mixer()
+        values = set()
+        for _ in range(100):
+            m.render()
+            values.add(tuple(m.mod_values()))
+        self.assertEqual(values, {(0.0, 0.0, 0.0, 0.0)})                 # no targets: not running
+        m.mods.update(targets=(1, 6, 0, 0), depths=(1.0, 0.5, 0.0, 0.0), rate=5.0)
+        seen = []
+        for _ in range(100):
+            m.render()
+            seen.append(m.mod_values()[0])
+        self.assertLess(min(seen), -0.8)
+        self.assertGreater(max(seen), 0.8)
+
+    def test_native_engine_tilt_lane_swings_the_rings(self):
+        e = app.Engine(app.make_params(), mixer=native.NativeMixer(LIB))
+        e.params["mto1"].index = e.params["mto1"].values.index("TILT")
+        e.params["mdep1"].index = e.params["mdep1"].values.index(100)
+        e.params["mrate"].index = e.params["mrate"].values.index(5)
+        e.apply()
+        tilts = set()
+        for _ in range(60):
+            e.mixer.render()
+            e.step(1 / 120)
+            tilts.add(round(math.degrees(e.rings.tilt)))
+        self.assertGreater(max(tilts) - min(tilts), 15)
+        state = app.ui_state(e, app.Menu(list(e.params.values())))
+        menu = app.Menu(list(e.params.values()))
+        for page, title in (("DRUMS", "STOP"), ("WARP", "OFF"), ("MODS", "MODS")):
+            menu.page = page
+            banner = app.ui_state(e, menu)["banner"]
+            self.assertEqual(banner[0], title)
+            self.assertIn(title, ui.render(app.ui_state(e, menu), 120, 40))
+        menu.page = "DRUMS"
+        self.assertEqual(len(app.ui_state(e, menu)["banner"][1]), 16)
+
     def test_every_exciter_sounds_pitched(self):
         for i, name in enumerate(native.EXCITERS):
             m = self.mixer()
@@ -1048,7 +1124,10 @@ class AppTest(unittest.TestCase):
         self.assertEqual(menu.page, "CHORDS")
         app.handle_key("page", e, menu)
         self.assertEqual(menu.page, "GRAINS")
-        app.handle_key("page", e, menu)                     # four pages, then back round
+        for page in ("DRUMS", "WARP", "MODS"):
+            app.handle_key("page", e, menu)
+            self.assertEqual(menu.page, page)
+        app.handle_key("page", e, menu)                     # seven pages, then back round
         self.assertIs(menu.selected(), balls_sel)
         self.assertEqual(app.parse_keys(b"\t"), ["page"])
 
@@ -1056,8 +1135,8 @@ class AppTest(unittest.TestCase):
         e = app.Engine(app.make_params())
         before = app.snapshot(e.params.values())
         rng = random.Random(9)
-        e.randomize(rng)
-        e.randomize(rng)
+        e.randomize(rng=rng)
+        e.randomize(rng=rng)
         self.assertNotEqual(app.snapshot(e.params.values()), before)
         self.assertTrue(e.undo())
         self.assertTrue(e.undo())
@@ -1072,7 +1151,7 @@ class AppTest(unittest.TestCase):
             e = app.Engine(app.make_params())
             rng = random.Random(3)
             for _ in range(25):
-                e.randomize(rng)
+                e.randomize(rng=rng)
             app.save_params(list(e.params.values()), path, e.history)
             loaded = app.load_history(path)
             self.assertEqual(len(loaded), app.HISTORY_MAX)
@@ -1181,13 +1260,55 @@ class AppTest(unittest.TestCase):
             e.undo()                                             # history entries migrate too
             self.assertEqual((e.v("instr"), e.v("chord")), ("RESONATOR", "RANDOM"))
 
+    def test_arpeggiator_port_walks_like_the_original(self):
+        from arp import Arpeggiator
+        def walk(mode, n=9, notes=3, range_=2):
+            a = Arpeggiator(mode, range_)
+            out = []
+            for _ in range(n):
+                a.clock(notes)
+                out.append((a.octave, a.note))
+            return out
+        self.assertEqual(walk("UP", 7), [(0, 1), (0, 2), (1, 0), (1, 1), (1, 2), (0, 0), (0, 1)])
+        self.assertEqual(walk("DOWN", 4), [(1, 2), (1, 1), (1, 0), (0, 2)])
+        up_down = walk("UP-DN", 12)
+        self.assertIn((1, 2), up_down)
+        self.assertEqual(up_down[up_down.index((1, 2)) + 1], (1, 1))      # turns round at the top
+        rnd = walk("RANDOM", 50)
+        self.assertTrue(all(a != b for a, b in zip(rnd, rnd[1:])))       # never the same twice in a row
+
+    def test_arp_plays_the_chord_on_every_instrument(self):
+        e = app.Engine(app.make_params())
+        e.params["arp"].index = e.params["arp"].values.index("UP")
+        e.params["chord"].index = e.params["chord"].values.index("IV")
+        e.apply()
+        k, sc = e.v("key"), e.v("scale")
+        tones = {pad_note(k, sc, 3 + 2 * i, o) % 12 for i in range(4) for o in (0, 1)}
+        notes = [e.hit_midi(edge, 0) for edge in (0, 0, 5, 1, 2, 0, 3, 4)]
+        self.assertEqual({n % 12 for n in notes}, tones)                 # walls don't matter, the chord does
+        self.assertLessEqual(set(notes), set(e.playable_notes()))
+        e.params["arp"].index = 0
+        self.assertEqual(e.hit_midi(2, 0), pad_note(k, sc, 2, e.v("octave")))
+
+    def test_python_engine_ignores_native_only_pages(self):
+        e = app.Engine(app.make_params())
+        menu = app.Menu(list(e.params.values()))
+        e.params["mto1"].index = e.params["mto1"].values.index("TILT")
+        e.params["dplay"].index = 1
+        e.apply()
+        self.assertEqual(e.tilt_lanes, [])
+        for page in ("DRUMS", "MODS"):
+            menu.page = page
+            self.assertIn("48K ONLY", app.ui_state(e, menu)["banner"][0])
+        e.step(0.1)
+
     def test_native_only_voices_have_python_stand_ins(self):
         e = app.Engine(app.make_params())                      # Python engine (forced in this module)
         for instr in ("SYNTH", "PHYSICAL"):
             e.params["instr"].index = e.params["instr"].values.index(instr)
             e.params["tone"].index = e.params["tone"].values.index("STRINGS")
             e.apply()
-            self.assertIn(e.note_args(0, 0)[1], ("BELL", "MARIMBA"))
+            self.assertIn(e.note_args(60)[1], ("BELL", "MARIMBA"))
             self.assertEqual(e.mixer.ring_timbre, "WARM")
             for _ in range(10):
                 e.mixer.render()
@@ -1210,7 +1331,9 @@ class AppTest(unittest.TestCase):
         octants = set(ui.OCTANT[1:]) - {"█"}
         page_labels = {"BALLS": ("GRAV", "BOUNCE", "SHAPE"), "RINGS": ("RINGS", "MOONS", "SPEED", "PAD", "FLOOR"),
                        "GRAINS": ("DENSITY", "SIZE", "POSITION", "TEXTURE", "FEEDBACK", "SOURCE"),
-                       "CHORDS": ("CLOCK", "CHANCE", "LENGTH", "DEJA VU", "BIAS")}
+                       "CHORDS": ("CLOCK", "CHANCE", "LENGTH", "DEJA VU", "BIAS"),
+                       "DRUMS": ("BPM", "MAP X", "CHAOS", "KICK", "HATS"), "WARP": ("CARRIER", "ALGO", "MIX"),
+                       "MODS": ("RATE", "SHAPE", "SHIFT", "TO 1", "DEPTH")}
         for mode, is_glyph in (("PIXEL", lambda c: c in "▀▄█"),
                                ("BEHIND", lambda c: c in "▀▄█"),
                                ("BLOCK", lambda c: c in octants),
@@ -1247,20 +1370,50 @@ class AppTest(unittest.TestCase):
         ps["grav"].nudge(-1)
         self.assertEqual(ps["grav"].value, 0)
 
-    def test_respawn_randomizes_settings_but_not_volume(self):
+    def test_respawn_randomizes_ball_settings_but_not_volume_or_shared(self):
         e = app.Engine(app.make_params())
         e.params["vol"].index = 3
+        shared = {k: e.v(k) for k in app.SHARED}
         seen = set()
         rng = random.Random(5)
         for _ in range(20):
-            e.randomize(rng)
-            seen.add(tuple(e.v(k) for k in ("key", "scale", "instr", "shape")))
+            e.randomize("BALLS", rng)
+            seen.add(tuple(e.v(k) for k in ("instr", "shape", "balls", "grav")))
             self.assertEqual(e.v("vol"), 15)
-            self.assertEqual(e.v("visual"), "PIXEL")
+            self.assertEqual({k: e.v(k) for k in shared}, shared)       # key, scale, reverb, ...
             self.assertTrue(2 <= e.v("balls") <= 6 and 60 <= e.v("bounce") <= 110)
             self.assertEqual(len(e.world.balls), e.v("balls"))
             self.assertEqual(e.world.sides, app.SHAPES[e.v("shape")])
         self.assertGreater(len(seen), 15)
+
+    def test_random_only_touches_the_current_page(self):
+        for page in app.PAGES:
+            e = app.Engine(app.make_params())
+            own = set(app.random_keys(page))
+            self.assertTrue(own)
+            self.assertFalse(own & app.SHARED)
+            before = app.snapshot(e.params.values())
+            balls = list(e.world.balls)
+            rng = random.Random(11)
+            for _ in range(8):
+                e.randomize(page, rng)
+            after = app.snapshot(e.params.values())
+            changed = {k for k in before if before[k] != after[k]}
+            self.assertTrue(changed, page)
+            self.assertLessEqual(changed, own, page)                     # nothing from other pages
+            if page != "BALLS":
+                self.assertEqual(e.world.balls, balls)                   # balls keep bouncing
+            self.assertTrue(e.undo())
+
+    def test_r_key_rolls_the_page_shown(self):
+        e = app.Engine(app.make_params())
+        menu = app.Menu(list(e.params.values()))
+        while menu.page != "GRAINS":
+            app.handle_key("page", e, menu)
+        before = app.snapshot(e.params.values())
+        app.handle_key("respawn", e, menu)
+        after = app.snapshot(e.params.values())
+        self.assertLessEqual({k for k in before if before[k] != after[k]}, set(app.random_keys("GRAINS")))
 
     def test_bed_chords_stay_in_scale_and_mute_when_off(self):
         e = app.Engine(app.make_params())

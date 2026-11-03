@@ -11,18 +11,19 @@ import threading
 import time
 import tty
 
-from music import SHAPES, pad_note
+from arp import Arpeggiator
+from music import KEYS, SHAPES, pad_note
 from marbles import ChordSequencer, LoopSequencer
 import native
-from params import (CONFIG, DEGREES, HISTORY_MAX, PAGES, PROGRESSIONS, RANDOM, RANDOM_RANGES,  # noqa: F401
-                    PHYSICAL, RESONATOR, RESONATOR_MODELS, SYNTH,
+from params import (CONFIG, DEGREES, HISTORY_MAX, PAGES, PROGRESSIONS, RANDOM, RANDOM_RANGES, SHARED, random_keys,  # noqa: F401
+                    MOD_TARGETS, PHYSICAL, RESONATOR, RESONATOR_MODELS, SYNTH, WARP_ALGOS,
                     apply_snapshot, load_history, load_params, make_params, page_params, save_params,
                     snapshot)
 from physics import BALL_SIZES, World
 from backdrop import FPS as BACKDROP_FPS, Backdrop, scene_commands
 from resonator import STRENGTHS, RenderPool, strength_step
 from rings import TAU, Rings
-from native import ENGINES, EXCITERS
+from native import ENGINES, EXCITERS, MOD_MODES, WARP_CARRIERS
 from synth import RING_TIMBRES, Mixer
 import ui
 
@@ -41,9 +42,14 @@ def make_mixer():
     return Mixer()
 FRAME_DT = 1 / 30
 PAD_LOWEST = 40                  # E2 (~82 Hz): the pad's bass never goes below this
-PREWARM_KEYS = {"key", "scale", "instr", "attack", "release", "octave", "shape",
+PREWARM_KEYS = {"key", "scale", "instr", "attack", "release", "octave", "shape", "arp",
                 "rmodel", "rstruct", "rbright", "rdamp", "rpos"}
 RING_ORDER = (1, 3, 2, 0)        # chord tones added as RINGS grows: root, +fifth, +third, +bass
+ARP_NOTES = 4                    # ARP walks the chord's 1-3-5-7
+ARP_RANGE = 2                    # ... across two octaves
+DRUM_ROOT = 24                   # kick tuned to the key's root in octave 1 (33..62 Hz)
+TILT_SWING = 15                  # degrees a full-depth MODS lane tilts the rings either way
+MOD_LANES = 4
 
 
 class Engine:
@@ -64,6 +70,8 @@ class Engine:
         self.next_change = None                  # TIME clock: seconds until the next tick
         self.hold = False                        # x: freeze the moving chord
         self.rng = random.Random()
+        self.arp = Arpeggiator(range_=ARP_RANGE, rng=self.rng)
+        self.tilt_lanes = []                     # (lane, depth) MODS lanes aimed at TILT
         lib = native.load() if isinstance(self.mixer, native.NativeMixer) else None
         self.sequencer = (LoopSequencer(lambda seed: native.RandomSource(lib, seed)) if lib
                           else ChordSequencer(rng=self.rng))
@@ -110,10 +118,29 @@ class Engine:
             self.mixer.res.update(model=RESONATOR_MODELS.index(self.v("rmodel")), poly=self.v("rpoly"),
                                   structure=self.v("rstruct") / 100, brightness=self.v("rbright") / 100,
                                   damping=self.v("rdamp") / 100, position=self.v("rpos") / 100)
+        if self.native:
+            self.apply_native_extras()
+        self.tilt_lanes = [(k, self.v(f"mdep{k + 1}") / 100) for k in range(MOD_LANES)
+                           if self.v(f"mto{k + 1}") == "TILT"] if self.native else []
         q = self.sequencer
         q.deja, q.spread, q.bias = self.v("deja") / 100, self.v("cspread") / 100, self.v("cbias") / 100
         if q.length != self.v("length"):
             q.set_length(self.v("length"))
+
+    def apply_native_extras(self):
+        """DRUMS, WARP and MODS: native only (the Python engine has none of them)."""
+        pc = lambda key: self.v(key) / 100
+        m = self.mixer
+        m.drums.update(play=int(self.on and self.v("dplay") == "ON"), bpm=float(self.v("dbpm")),
+                       x=pc("dx"), y=pc("dy"), chaos=pc("dchaos"),
+                       density=(pc("dkick"), pc("dsnare"), pc("dhats")), level=pc("dvol") * 1.2,
+                       tone=pc("dtone"), decay=pc("ddecay"), note=float(DRUM_ROOT + KEYS.index(self.v("key"))))
+        m.warp.update(carrier=WARP_CARRIERS.index(self.v("wcar")), algo=pc("walgo"), timbre=pc("wtimb"),
+                      drive=0.6 + 0.4 * pc("wdrive"), mix=pc("wmix"))     # below 0.6 the vocoder goes silent
+        m.mods.update(mode=MOD_MODES.index(self.v("mmode")), rate=float(self.v("mrate")),
+                      shape=pc("mshape"), slope=pc("mslope"), smooth=pc("msmooth"), shift=pc("mshift"),
+                      targets=tuple(MOD_TARGETS.index(self.v(f"mto{k}")) for k in range(1, MOD_LANES + 1)),
+                      depths=tuple(pc(f"mdep{k}") for k in range(1, MOD_LANES + 1)))
 
     def ball_vol(self):
         return self.v("vol") / 100 * 1.2
@@ -137,18 +164,31 @@ class Engine:
         chord, pad and moons alike, an octave — negative steps go into sub-bass.
         Independent of the balls.
         """
-        name = self.v("chord")
-        if name in DEGREES:
-            degree = DEGREES.index(name)
-        elif name == RANDOM:
-            degree = self.sequencer.current
-        else:
-            prog = PROGRESSIONS[name]
-            degree = prog[step % len(prog)]
+        degree = self.chord_degree(step)
         k, sc = self.v("key"), self.v("scale")
         notes = [pad_note(k, sc, degree, -1)] + [pad_note(k, sc, degree + i, 0) for i in (0, 2, 4)]
         lift = 12 * max(0, -(-(PAD_LOWEST - notes[0]) // 12))
         return [m + lift + 12 * self.v("roct") for m in notes]
+
+    def chord_degree(self, step):
+        """The current chord's scale degree (0 = I)."""
+        name = self.v("chord")
+        if name in DEGREES:
+            return DEGREES.index(name)
+        if name == RANDOM:
+            return self.sequencer.current
+        prog = PROGRESSIONS[name]
+        return prog[step % len(prog)]
+
+    def hit_midi(self, edge, ball_octave):
+        """A ball's note: the wall's pad, or with ARP the chord's next note (every instrument)."""
+        k, sc, octave = self.v("key"), self.v("scale"), self.v("octave")
+        if self.v("arp") == "OFF":
+            return pad_note(k, sc, edge, octave, ball_octave)
+        self.arp.mode = self.v("arp")
+        self.arp.clock(ARP_NOTES)
+        degree = self.chord_degree(self.chord_step) + 2 * self.arp.note
+        return pad_note(k, sc, degree, octave + self.arp.octave, ball_octave)
 
     def ring_notes(self):
         """Each ring's note, innermost first: RINGS picks how many chord tones sound
@@ -162,15 +202,20 @@ class Engine:
         floor = self.v("floor") / 100
         return [(m, floor + (1 - floor) * self.rings.level(k)) for k, m in enumerate(self.ring_notes())]
 
-    def randomize(self, rng=random):
-        """New random settings (within RANDOM_RANGES) and freshly dropped balls; u undoes it."""
+    def randomize(self, page="BALLS", rng=random):
+        """New random settings for one page only (within RANDOM_RANGES); u undoes it.
+
+        Settings shared by several pages (key, scale, reverb, ...) are left alone.
+        On BALLS the balls are dropped fresh too.
+        """
         self.history = (self.history + [snapshot(self.params.values())])[-HISTORY_MAX:]
-        for key, bounds in RANDOM_RANGES.items():
-            p = self.params[key]
+        for key in random_keys(page):
+            p, bounds = self.params[key], RANDOM_RANGES[key]
             ok = [i for i, v in enumerate(p.values) if bounds is None or bounds[0] <= v <= bounds[1]]
             p.index = rng.choice(ok)
         self.apply()
-        self.world.respawn()
+        if page == "BALLS":
+            self.world.respawn()
         self.prewarm()
 
     def undo(self):
@@ -182,8 +227,7 @@ class Engine:
         self.prewarm()
         return True
 
-    def note_args(self, edge, ball_octave):
-        midi = pad_note(self.v("key"), self.v("scale"), edge, self.v("octave"), ball_octave)
+    def note_args(self, midi):
         instr = PY_STANDIN.get(self.v("instr"), self.v("instr"))     # native-only voices on Python
         return midi, instr, self.v("attack"), self.v("release")
 
@@ -208,12 +252,20 @@ class Engine:
     def native(self):
         return isinstance(self.mixer, native.NativeMixer)
 
-    def ball_sound(self, edge, ball_octave, strength=0.75):
+    def ball_sound(self, midi, strength=0.75):
         """The hit's buffer; with RESONATOR possibly None for a moment after a setting change."""
         if self.v("instr") == RESONATOR:
-            midi = pad_note(self.v("key"), self.v("scale"), edge, self.v("octave"), ball_octave)
             return self.pool.get(self.resonator_args(midi, strength))
-        return self.mixer.note(*self.note_args(edge, ball_octave))
+        return self.mixer.note(*self.note_args(midi))
+
+    def playable_notes(self):
+        """Every note a hit can play now: the walls' pads, or with ARP every chord's 1-3-5-7."""
+        k, sc, octave = self.v("key"), self.v("scale"), self.v("octave")
+        if self.v("arp") == "OFF":
+            spots = [(e, 0) for e in range(self.world.sides)]
+        else:
+            spots = [(d, a) for d in range(len(DEGREES) + 2 * (ARP_NOTES - 1)) for a in range(ARP_RANGE)]
+        return sorted({pad_note(k, sc, d, octave + a, o) for d, a in spots for _, o in BALL_SIZES})
 
     def prewarm(self):
         """Render every note the current setup can play, off the UI thread.
@@ -221,15 +273,14 @@ class Engine:
         One worker; a newer request supersedes the one in progress, so holding
         a key down costs one render pass, not a thread per key repeat.
         """
-        jobs = [(e, o, s) for e in range(self.world.sides) for _, o in BALL_SIZES
+        jobs = [(m, s) for m in self.playable_notes()
                 for s in (STRENGTHS if self.v("instr") == RESONATOR else (0.75,))]
         if self.v("instr") == RESONATOR:
             if self.native:                          # the native core resonates in real time
                 return
             # the Python fallback renders resonator hits in other processes
-            for e, o, s in jobs:
-                midi = pad_note(self.v("key"), self.v("scale"), e, self.v("octave"), o)
-                self.pool.request(self.resonator_args(midi, s))
+            for m, s in jobs:
+                self.pool.request(self.resonator_args(m, s))
             return
         self._warm_jobs = jobs
         self._warm_wake.set()
@@ -249,19 +300,25 @@ class Engine:
     def step(self, dt):
         for hit in self.world.step(dt):
             strength = min(1.0, 0.08 + hit.speed / 2.0)               # hard hits louder (and brighter)
+            midi = self.hit_midi(hit.edge, hit.octave)
             if self.native and self.v("instr") in (RESONATOR, SYNTH, PHYSICAL):
-                midi = pad_note(self.v("key"), self.v("scale"), hit.edge, self.v("octave"), hit.octave)
                 play = {RESONATOR: self.mixer.strike, SYNTH: self.mixer.synth_hit,
                         PHYSICAL: self.mixer.physical_hit}[self.v("instr")]
                 play(midi, strength * self.ball_vol())
                 self.hits += 1
                 continue
-            buf = self.ball_sound(hit.edge, hit.octave, strength)
+            buf = self.ball_sound(midi, strength)
             if buf is None:                          # first-ever render of this note still running
                 continue
             poly = self.v("rpoly") if self.v("instr") == RESONATOR else None
             self.mixer.trigger(buf, 0.4 * strength * self.ball_vol(), group="balls", poly=poly)
             self.hits += 1
+        if self.tilt_lanes:                      # MODS lanes on TILT swing the rings
+            lanes = self.mixer.mod_values()
+            swing = sum(depth * lanes[k] for k, depth in self.tilt_lanes)
+            self.rings.tilt = math.radians(max(0.0, self.v("tilt") + TILT_SWING * swing))
+        if self.native:
+            self.mixer.warp["note"] = float(self.chord(self.chord_step)[1])   # the oscillator plays the root
         before = self.outer_moons()
         self.rings.step(dt)
         if self.clock_tick(dt, before) and not self.hold and self.rng.random() < self.v("chance") / 100:
@@ -401,7 +458,7 @@ def handle_key(k, engine, menu):
     elif k == "toggle":
         engine.set_on(not engine.on)
     elif k == "respawn":
-        engine.randomize()
+        engine.randomize(menu.page)
     elif k == "undo":
         engine.undo()
     elif k == "regenerate":
@@ -493,6 +550,52 @@ def chord_row(engine):
     return "CHORD", [(name, True, False)]
 
 
+def drum_glyph(hits):
+    """A 16th on the DRUMS bar: K kick, S snare, X both, H hats only, · nothing."""
+    if 0 in hits and 1 in hits:
+        return "X"
+    return "KSH"[hits[0]] if hits else "·"
+
+
+def drum_row(engine):
+    """(title, cells, tight) for DRUMS: the bar as 16 sixteenths, playhead lit, accents marked."""
+    if not engine.native:
+        return "DRUMS 48K ONLY", [], True
+    levels = engine.mixer.drum_levels(engine.v("dx") / 100, engine.v("dy") / 100)
+    density = [engine.v(k) / 100 for k in ("dkick", "dsnare", "dhats")]
+    playing = engine.mixer.drum_step() // 2 if engine.v("dplay") == "ON" else -1
+    cells = []
+    for s in range(0, 32, 2):
+        hits = [p for p in range(3) if density[p] > 0 and levels[p][s] > 255 - 255 * density[p]]
+        accent = any(levels[p][s] > 192 for p in hits)
+        cells.append((drum_glyph(hits), s // 2 == playing, accent))
+    return ("PLAY" if engine.v("dplay") == "ON" else "STOP"), cells, True
+
+
+def warp_row(engine):
+    """(title, cells) for WARP: the algorithm ALGO sits on."""
+    a = engine.v("walgo") / 100
+    at = len(WARP_ALGOS) - 1 if a >= 0.725 else min(len(WARP_ALGOS) - 2, round(a * 8))
+    title = "WARP" if engine.v("wmix") else "OFF"
+    return title, [(name, i == at, False) for i, name in enumerate(WARP_ALGOS)]
+
+
+BARS = " ▁▂▃▄▅▆▇█"
+
+
+def mods_row(engine):
+    """(title, cells) for MODS: each lane's live value as a bar, lit when it has a target."""
+    values = engine.mixer.mod_values() if engine.native else [0.0] * MOD_LANES
+    cells = []
+    for k, v in enumerate(values):
+        bar = BARS[min(len(BARS) - 1, int((v + 1) / 2 * len(BARS)))]
+        cells.append((f"{k + 1}{bar}", engine.v(f"mto{k + 1}") != "OFF", False))
+    return "MODS" if engine.native else "MODS 48K ONLY", cells
+
+
+BANNERS = {"CHORDS": chord_row, "DRUMS": drum_row, "WARP": warp_row, "MODS": mods_row}
+
+
 def ui_state(engine, menu, output=None, fx=None, window=None):
     side, knobs = page_params(menu.params, menu.page)
     return {"side": side, "knobs": knobs, "selected": menu.selected(), "pages": menu.pages,
@@ -502,4 +605,5 @@ def ui_state(engine, menu, output=None, fx=None, window=None):
             "engine": engine.mixer.name, "error": " ".join(e for e in (output.error if output else "",
                                           window.error if window else "") if e),
             "fx": fx, "window": engine.v("window") == "ON",
-            "chords": chord_row(engine) if menu.page == "CHORDS" else None, "hold": engine.hold}
+            "banner": BANNERS[menu.page](engine) if menu.page in BANNERS else None,
+            "hold": engine.hold and menu.page == "CHORDS"}

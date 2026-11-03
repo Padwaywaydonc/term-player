@@ -136,8 +136,10 @@ Saturn rings:
   degree (`I`…`VII`, also keys `1`–`7` on the RINGS and CHORDS pages), runs a
   progression, or `RANDOM` — a random chord loop (see the CHORDS page below).
 - **Grains** — a granular processor on its own `GRAINS` page. It records the
-  balls, the rings or both (`SOURCE`) and replays grains from it: `MODE`
-  (`GRANULAR`, `STRETCH` time-stretching, `DELAY` looping delay, `SPECTRAL`),
+  balls, the rings or both (`SOURCE`; `ALL` includes the drums) and replays grains
+  from it: `MODE` (`GRANULAR`, `STRETCH` time-stretching, `DELAY` looping delay,
+  `SPECTRAL`, and `SCATTER`, a newer grain engine at 48 kHz where `SPREAD`
+  randomises each grain's position, size and pitch),
   `DENSITY` (negative = steady rate, 0 = none, positive = random), `SIZE`,
   `POSITION` (how far back), `PITCH` (±12 semitones), `SPREAD` (stereo spread),
   `TEXTURE` (grain window: square → triangle → smooth, then a smearing diffuser),
@@ -145,13 +147,39 @@ Saturn rings:
   recording and keep granulating what's in the buffer; also `f`) and `GRAIN`
   (level). Each grain shows as a brief spark.
 
+- **Arpeggio** — `ARP` on the BALLS page (`UP` `DOWN` `UP-DN` `RANDOM`): every
+  hit, with any instrument, plays the next note of the current chord (1-3-5-7
+  over two octaves) instead of the wall's note.
+- **Drums** — the `DRUMS` page. A drum-pattern map: `MAP X` goes from straight
+  (four-on-the-floor kick, backbeat, offbeat hats) to broken, `MAP Y` from
+  sparse to busy; `KICK` `SNARE` `HATS` set how many of each part's steps play,
+  `CHAOS` adds random extra hits each bar. `PLAY` starts it (it never starts on
+  its own, `r` leaves it alone), `BPM`, `TONE`, `DECAY`, `VOL`. The kick follows
+  the key. The top row shows the bar as sixteenths (`K` kick, `S` snare, `X`
+  both, `H` hats; accents amber, the playing step lit).
+- **Warp** — the `WARP` page: the balls cross-modulate a `CARRIER` (the rings,
+  the drums, or an oscillator `SINE` `TRI` `SAW` on the chord's root). `ALGO`
+  sweeps crossfade, fold, analog and digital ring modulation, XOR, compare, and
+  at the top a vocoder (the balls "speak" through the rings); `TIMBRE` is each
+  algorithm's parameter, `DRIVE` the input saturation (it changes the
+  character; the level is matched to the dry sound), `MIX` 0% = off.
+- **Mods** — the `MODS` page: four slow modulation lanes from one function
+  generator. `RATE`, `SHAPE`, `SLOPE` (rise vs fall), `SMOOTH`; `MODE` `PHASE`
+  makes the lanes phase-shifted copies, `FREQ` runs them at related rates, `AMP`
+  pans one shape across them, `SHIFT` sets how far apart they are. Aim each lane
+  (`TO 1`…`TO 4`) at a sound setting — grain position/size/density/texture/level,
+  the synth, resonator or physical voice, ring timbre, pad, reverb, warp, drum
+  map, chaos, or the rings' `TILT` — with a `DEPTH` of ±100%. The top row shows
+  the four lanes live.
+
 **Audio engine.** `./install.sh` builds a small native core (`native/`, needs
 `make` and `g++`): 48 kHz stereo, with the resonator, granular processor and
 reverb, synth voice, physical-modelling voice and random-sequence DSP from
 Emilie Gillet's open-source eurorack code (MIT — see `NOTICE`), plus the
-ring-chord voices and the mix. `SYNTH` and `PHYSICAL` ball voices and the
-synth-engine ring timbres need it (the Python engine stands in with `BELL`,
-`MARIMBA` and `WARM`). If it isn't built, tombola falls back to
+ring-chord voices and the mix. `SYNTH` and `PHYSICAL` ball voices, the
+synth-engine ring timbres, `SCATTER`, and the DRUMS, WARP and MODS pages need it
+(the Python engine stands in with `BELL`, `MARIMBA` and `WARM`, and shows
+DRUMS / MODS as `48K ONLY`). If it isn't built, tombola falls back to
 its pure-Python engine (22.05 kHz mono, simplified resonator and grains); the
 status line shows `48K` or `PY`, and `TOMBOLA_ENGINE=python` forces the fallback.
 Ball instruments `PLUCK` (Karplus-Strong), `BELL` (FM), `MARIMBA`, `GLASS`,
@@ -185,20 +213,23 @@ random sequence and each value maps to a chord on a colourful → stable ladder:
 chord lit and freshly regenerated ones marked with a dot. `g` regenerates the
 whole loop, `x` holds the current chord.
 
-Settings are split over four pages — `Tab` switches:
+Settings are split over seven pages — `Tab` switches:
 
 | Page    | Settings |
 |---------|----------|
-| `BALLS` | `KEY` `SCALE` `INSTR` `ATTACK` `RELEASE` `SHAPE` `VISUAL` `BALLS` `GRAV` `ROT` `BOUNCE` `OCTAVE` `REVERB` `GRAIN` `VOL` (ball volume); with `INSTR` `RESONATOR`: `MODEL` `STRUCTURE` `BRIGHTNESS` `DAMPING` `POSITION` `POLY` in place of `ATTACK` `RELEASE` |
+| `BALLS` | `KEY` `SCALE` `INSTR` `ARP` `ATTACK` `RELEASE` `SHAPE` `VISUAL` `BALLS` `GRAV` `ROT` `BOUNCE` `OCTAVE` `REVERB` `GRAIN` `VOL` (ball volume); with `INSTR` `RESONATOR`: `MODEL` `STRUCTURE` `BRIGHTNESS` `DAMPING` `POSITION` `POLY` in place of `ATTACK` `RELEASE` |
 | `CHORDS` | `KEY` `SCALE` `CHORD` `CLOCK` (`MOON` `TIME`) `VISUAL` `WINDOW` `CHANGE` `JITTER` `CHANCE` `LENGTH` `DEJA VU` `SPREAD` `BIAS` `OCTAVE` |
 | `GRAINS` | `KEY` `SCALE` `SOURCE` (`ALL` `BALLS` `RINGS`) `MODE` `FREEZE` `VISUAL` `WINDOW` `GRAIN` (level) `DENSITY` `SIZE` `POSITION` `PITCH` `SPREAD` `TEXTURE` `FEEDBACK` `REVERB` |
+| `DRUMS` | `KEY` `SCALE` `PLAY` `VISUAL` `WINDOW` `BPM` `MAP X` `MAP Y` `CHAOS` `KICK` `SNARE` `HATS` `TONE` `DECAY` `VOL` |
+| `WARP` | `KEY` `SCALE` `CARRIER` (`RINGS` `DRUMS` `SINE` `TRI` `SAW`) `VISUAL` `WINDOW` `ALGO` `TIMBRE` `DRIVE` `MIX` |
+| `MODS` | `KEY` `SCALE` `MODE` (`PHASE` `FREQ` `AMP`) `VISUAL` `WINDOW` `RATE` `SHAPE` `SLOPE` `SMOOTH` `SHIFT` `TO 1`…`TO 4` with a `DEPTH` each |
 | `RINGS` | `KEY` `SCALE` `INSTR` (ring timbre: `WARM` `GLASS` `SINE` `ORGAN` `SAW`) `CHORD` (held degree `I`…`VII`, or a progression) `RATIO` (orbit speeds: `KEPLER` outer-slower, `HARM`, `PRIME`, `GOLD`, `SYNC`) `VISUAL` `WINDOW` `RINGS` (chord notes, 0–4) `MOONS` (swells per orbit) `SPEED` `TILT` `OCTAVE` (−3…+3; 0 = lowest clearly audible, below = sub-bass) `PAD` (ring level) `FLOOR` (volume with the moon at its lowest: 0% silent … 100% drone) `REVERB` `GRAIN` `VOL` (ring volume) |
 
 In a full-size pane every setting of the page is a knob along the bottom.
 
 | Key            | Action                                    |
 |----------------|-------------------------------------------|
-| `Tab`          | switch page: BALLS / RINGS / CHORDS / GRAINS |
+| `Tab`          | switch page: BALLS / RINGS / CHORDS / GRAINS / DRUMS / WARP / MODS |
 | `←` / `→`      | select setting (also `h` / `l`)           |
 | `↑` / `↓`      | change it (also `k` / `j`)                |
 | `3` … `8`      | BALLS page: shape — triangle, square, pentagon … octagon |
@@ -213,7 +244,7 @@ In a full-size pane every setting of the page is a knob along the bottom.
 | `w`            | live backdrop window behind Windows Terminal |
 | `f`            | freeze the grain buffer                   |
 | `Space`        | on / off (freezes everything, mutes the pad) |
-| `r`            | random: new random settings + fresh balls (keeps VOL and VISUAL) |
+| `r`            | random: rolls only the page shown (BALLS also drops fresh balls); never VOL or shared settings (KEY, SCALE, CHORD, ring OCTAVE, REVERB, GRAIN, VISUAL, WINDOW), DRUMS `PLAY` or WARP `MIX` |
 | `u`            | undo the last `r` (remembers the last 20 rolls, across restarts) |
 | `q`            | quit                                      |
 

@@ -23,7 +23,9 @@ ENGINES = ("VA-VCF", "PHASE-D", "6OP-A", "6OP-B", "6OP-C", "TERRAIN", "STRINGS",
            "SWARM", "NOISE", "PARTICLE", "STRING", "MODAL", "KICK", "SNARE", "HIHAT")
 EXCITERS = ("STRIKE", "BOW", "BLOW", "ALL")
 SOURCES = ("ALL", "BALLS", "RINGS")
-GRAIN_MODES = ("GRANULAR", "STRETCH", "DELAY", "SPECTRAL")
+GRAIN_MODES = ("GRANULAR", "STRETCH", "DELAY", "SPECTRAL", "SCATTER")
+WARP_CARRIERS = ("RINGS", "DRUMS", "SINE", "TRI", "SAW")
+MOD_MODES = ("PHASE", "FREQ", "AMP")
 GROUPS = {"balls": 0}
 
 
@@ -45,7 +47,16 @@ class TcParams(ctypes.Structure):     # mirrors Params in native/tombola_core.cc
                 ("ring_timbre2", ctypes.c_float), ("ring_morph", ctypes.c_float),
                 ("phys_exciter", ctypes.c_int), ("phys_geometry", ctypes.c_float),
                 ("phys_brightness", ctypes.c_float), ("phys_damping", ctypes.c_float),
-                ("phys_position", ctypes.c_float), ("phys_space", ctypes.c_float)]
+                ("phys_position", ctypes.c_float), ("phys_space", ctypes.c_float),
+                ("warp_carrier", ctypes.c_int), ("warp_algo", ctypes.c_float), ("warp_timbre", ctypes.c_float),
+                ("warp_drive", ctypes.c_float), ("warp_mix", ctypes.c_float), ("warp_note", ctypes.c_float),
+                ("drum_play", ctypes.c_int), ("drum_bpm", ctypes.c_float), ("drum_x", ctypes.c_float),
+                ("drum_y", ctypes.c_float), ("drum_chaos", ctypes.c_float), ("drum_density", ctypes.c_float * 3),
+                ("drum_level", ctypes.c_float), ("drum_tone", ctypes.c_float), ("drum_decay", ctypes.c_float),
+                ("drum_note", ctypes.c_float),
+                ("mod_mode", ctypes.c_int), ("mod_rate", ctypes.c_float), ("mod_shape", ctypes.c_float),
+                ("mod_slope", ctypes.c_float), ("mod_smooth", ctypes.c_float), ("mod_shift", ctypes.c_float),
+                ("mod_target", ctypes.c_int * 4), ("mod_depth", ctypes.c_float * 4)]
 
 
 def load():
@@ -75,6 +86,10 @@ def load():
     lib.tc_grains.restype = ctypes.c_long
     lib.tc_voices.argtypes = [ctypes.c_void_p]
     lib.tc_voices.restype = ctypes.c_int
+    lib.tc_mods.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float)]
+    lib.tc_drum_step.argtypes = [ctypes.c_void_p]
+    lib.tc_drum_step.restype = ctypes.c_int
+    lib.tc_drum_levels.argtypes = [ctypes.c_void_p, ctypes.c_float, ctypes.c_float, ctypes.POINTER(ctypes.c_uint8)]
     return lib
 
 
@@ -107,6 +122,11 @@ class NativeMixer:
         self.synth = dict(engine=8, harmonics=0.5, timbre=0.5, morph=0.5, decay=0.5, colour=0.5)
         self.ring_synth = dict(engine=-1, harmonics=0.5, timbre=0.5, morph=0.5)      # -1: built-in timbres
         self.physical = dict(exciter=0, geometry=0.5, brightness=0.5, damping=0.5, position=0.3, space=0.3)
+        self.warp = dict(carrier=0, algo=0.0, timbre=0.5, drive=0.5, mix=0.0, note=48.0)
+        self.drums = dict(play=0, bpm=120.0, x=0.5, y=0.5, chaos=0.0, density=(0.5, 0.5, 0.5), level=0.7,
+                          tone=0.5, decay=0.5, note=28.0)
+        self.mods = dict(mode=0, rate=0.2, shape=0.5, slope=0.5, smooth=0.5, shift=0.5,
+                         targets=(0, 0, 0, 0), depths=(0.0, 0.0, 0.0, 0.0))
         self.cache = {}
         self._params = TcParams()
         self._out = (ctypes.c_int16 * (BLOCK * CHANNELS))()
@@ -156,6 +176,21 @@ class NativeMixer:
     def active(self):
         return self.lib.tc_voices(self.handle)
 
+    def mod_values(self):
+        """The four MODS lanes' latest values, -1..1."""
+        out = (ctypes.c_float * 4)()
+        self.lib.tc_mods(self.handle, out)
+        return list(out)
+
+    def drum_step(self):
+        return self.lib.tc_drum_step(self.handle)
+
+    def drum_levels(self, x, y):
+        """The drum map at x, y (0..1): [kick, snare, hats] levels 0..255 for each of 32 steps."""
+        out = (ctypes.c_uint8 * 96)()
+        self.lib.tc_drum_levels(self.handle, x, y, out)
+        return [list(out[i * 32:(i + 1) * 32]) for i in range(3)]
+
     def render(self, n=BLOCK):
         """n frames of interleaved stereo s16 (n is rounded to the core's 48-frame chunks)."""
         p, c, r = self._params, self.cloud, self.res
@@ -178,6 +213,15 @@ class NativeMixer:
         p.ring_timbre2, p.ring_morph = rs["timbre"], rs["morph"]
         p.phys_exciter, p.phys_geometry, p.phys_brightness = ph["exciter"], ph["geometry"], ph["brightness"]
         p.phys_damping, p.phys_position, p.phys_space = ph["damping"], ph["position"], ph["space"]
+        w, d, m = self.warp, self.drums, self.mods
+        p.warp_carrier, p.warp_algo, p.warp_timbre = w["carrier"], w["algo"], w["timbre"]
+        p.warp_drive, p.warp_mix, p.warp_note = w["drive"], w["mix"], w["note"]
+        p.drum_play, p.drum_bpm, p.drum_x, p.drum_y, p.drum_chaos = d["play"], d["bpm"], d["x"], d["y"], d["chaos"]
+        p.drum_density[:] = d["density"]
+        p.drum_level, p.drum_tone, p.drum_decay, p.drum_note = d["level"], d["tone"], d["decay"], d["note"]
+        p.mod_mode, p.mod_rate, p.mod_shape, p.mod_slope = m["mode"], m["rate"], m["shape"], m["slope"]
+        p.mod_smooth, p.mod_shift = m["smooth"], m["shift"]
+        p.mod_target[:], p.mod_depth[:] = m["targets"], m["depths"]
         self.lib.tc_set_params(self.handle, ctypes.byref(p))
         n = n // 48 * 48
         out = self._out if n == BLOCK else (ctypes.c_int16 * (n * CHANNELS))()

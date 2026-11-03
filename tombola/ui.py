@@ -246,7 +246,7 @@ def _hints(width, page="BALLS"):
     """Key hints that fit in width columns; page/shape/key/scale keys win over the rest.
 
     Digits mean shape on BALLS and chord degree on RINGS."""
-    swap = {"BALLS": None, "RINGS": ("1-7", "chord"), "CHORDS": ("g x", "new/hold"), "GRAINS": ("f", "freeze")}[page]
+    swap = {"RINGS": ("1-7", "chord"), "CHORDS": ("g x", "new/hold"), "GRAINS": ("f", "freeze")}.get(page)
     hints = HINTS if swap is None else tuple(swap if h[1] == "shape" else h for h in HINTS)
     order = (0, 3, 4, 5, 6, 12, 10, 11, 8, 1, 2, 9, 7)
     keep, used = set(), 0
@@ -349,19 +349,23 @@ def scene(state, cols, rows):
 
 
 def _chord_row(state, width):
-    """The CHORDS page's loop: current chord lit, freshly regenerated ones in amber with a dot."""
-    if not state.get("chords"):
+    """A page's one-line banner: the CHORDS loop (current lit, freshly regenerated in amber
+    with a dot), the DRUMS bar (tight: one column per step, accents in amber), WARP's
+    algorithm or the MODS lanes."""
+    if not state.get("banner"):
         return None
-    title, cells = state["chords"]
-    label = f"{fg(DIM)}{'HOLD' if state.get('hold') else title}{RESET} "
-    parts, used = [], 5
+    title, cells, *tight = state["banner"]
+    tight = bool(tight and tight[0])
+    title = "HOLD" if state.get("hold") else title
+    label = f"{fg(DIM)}{title}{RESET} "
+    parts, used = [], len(title) + 1
     for name, current, fresh in cells:
-        text = f"{name}{'•' if fresh else ''}"
-        if used + len(text) + 3 > width:
+        text = name if tight else f" {name}{'•' if fresh else ''} "
+        if used + len(text) + (0 if tight else 1) > width:
             break
         style = SELECT if current else fg(AMBER if fresh else DIM)
-        parts.append(f"{style} {text} {RESET}")
-        used += len(text) + 3
+        parts.append(f"{style}{text}{RESET}")
+        used += len(text) + (0 if tight else 1)
     return label + "".join(parts)
 
 

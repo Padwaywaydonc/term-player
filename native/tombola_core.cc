@@ -26,9 +26,14 @@
 #include "marbles/random/random_generator.h"
 #include "marbles/random/random_sequence.h"
 #include "marbles/random/random_stream.h"
-#include "plaits/dsp/voice.h"
 #include "rings/dsp/part.h"
 #include "stmlib/utils/buffer_allocator.h"
+
+#include "drums.h"
+#include "mods.h"
+#include "scatter.h"
+#include "synth_voice.h"
+#include "warp.h"
 
 namespace {
 
@@ -58,39 +63,39 @@ struct Params {                        // mirrors TcParams in tombola/native.py
   // physical-modelling voice for the balls: exciter 0 strike, 1 bow, 2 blow, 3 all
   int phys_exciter;
   float phys_geometry, phys_brightness, phys_damping, phys_position, phys_space;
+  // WARP: carrier 0 rings, 1 drums, 2 sine, 3 tri, 4 saw (at warp_note); mix 0 = off
+  int warp_carrier;
+  float warp_algo, warp_timbre, warp_drive, warp_mix, warp_note;
+  // DRUMS
+  int drum_play;
+  float drum_bpm, drum_x, drum_y, drum_chaos, drum_density[3], drum_level, drum_tone, drum_decay, drum_note;
+  // MODS: output mode 0 phase, 1 frequency, 2 amplitude; lane targets index kModTargets
+  int mod_mode;
+  float mod_rate, mod_shape, mod_slope, mod_smooth, mod_shift;
+  int mod_target[4];
+  float mod_depth[4];
 };
 
-// One synth-engine voice. Balls ping its low-pass gate with a trigger; rings hold it
-// open with the level input, so a ring note gets darker as well as quieter as it fades.
-struct SynthVoice {
-  plaits::Voice voice;
-  char ram[16384];
-  plaits::Patch patch;
-  plaits::Modulations mod;
-  float gain = 0;
-  int trigger = 0;                     // blocks left with the trigger input high
-  void init(bool held) {
-    stmlib::BufferAllocator allocator(ram, sizeof(ram));
-    voice.Init(&allocator);
-    std::memset(&patch, 0, sizeof patch);
-    std::memset(&mod, 0, sizeof mod);
-    patch.note = 60; patch.harmonics = 0.5f; patch.timbre = 0.5f; patch.morph = 0.5f;
-    patch.decay = 0.5f; patch.lpg_colour = 0.5f;
-    mod.trigger_patched = !held;
-    mod.level_patched = held;
+const int kScatterMode = 4;            // grain_mode index of SCATTER (after the four cloud modes)
+
+// MODS targets, in the order of MOD_TARGETS in tombola/params.py (0 = off). Each is a
+// 0..1 setting a lane sweeps by up to +-depth; DENSITY runs -1..1, so it gets twice the swing.
+float* mod_slot(Params& p, int target) {
+  switch (target) {
+    case 1: return &p.grain_position;   case 2: return &p.grain_size;
+    case 3: return &p.grain_density;    case 4: return &p.grain_texture;
+    case 5: return &p.grain_level;      case 6: return &p.synth_timbre;
+    case 7: return &p.synth_harmonics;  case 8: return &p.synth_morph;
+    case 9: return &p.res_brightness;   case 10: return &p.res_structure;
+    case 11: return &p.res_position;    case 12: return &p.phys_geometry;
+    case 13: return &p.phys_brightness; case 14: return &p.ring_timbre2;
+    case 15: return &p.ring_morph;      case 16: return &p.ring_level;
+    case 17: return &p.reverb;          case 18: return &p.warp_algo;
+    case 19: return &p.warp_timbre;     case 20: return &p.drum_x;
+    case 21: return &p.drum_y;          case 22: return &p.drum_chaos;
+    default: return nullptr;            // 0 off; 23 TILT is applied by Python (it moves the rings)
   }
-  void render(float* l, float* r, int n, float pan) {      // n <= 24
-    plaits::Voice::Frame frames[24];
-    mod.trigger = trigger > 0 ? 1.0f : 0.0f;
-    if (trigger > 0) --trigger;
-    voice.Render(patch, mod, frames, n);
-    for (int i = 0; i < n; ++i) {
-      float out = frames[i].out / 32768.0f, aux = frames[i].aux / 32768.0f;
-      l[i] += gain * (out * (1 - pan) + 0.35f * aux * pan);
-      r[i] += gain * (out * pan + 0.35f * aux * (1 - pan));
-    }
-  }
-};
+}
 
 struct Hit { float note, strength; };
 
@@ -218,6 +223,10 @@ struct Engine {
   float physical_note = 60, physical_strength = 0;
   Upsampler physical_up;
   float grain_clock = 0;
+  Mods mods;
+  Drums drums;
+  Warp warp;
+  Scatter scatter;
 
   void init() {
     part.Init(part_reverb);
@@ -230,6 +239,13 @@ struct Engine {
     for (auto& v : synth) v.init(false);
     for (auto& v : ring_synth) v.init(true);
     physical.Init(physical_reverb);
+    mods.init();
+    drums.init();
+    warp.init();
+    scatter.init();
+    // The new processors draw from the shared random generator while starting up: put it back
+    // to its initial state so the voices start from the same noise as before they existed.
+    stmlib::Random::Seed(0x21);
     reverb.set_diffusion(0.7f);
     reverb.set_lp(0.7f);
     reverb.set_time(0.75f);
@@ -400,6 +416,23 @@ struct Engine {
     physical_up.run(main32, aux32, 32, l, r, kChunk, [g](float& o, float x) { o += g * x; });
   }
 
+  // WARP: the balls modulate the carrier; MIX crossfades both into the warped sound.
+  void render_warp(float* bl, float* br, float* rl, float* rr, float* dl, float* dr) {
+    if (p.warp_mix <= 0) return;
+    int kind = std::max(0, std::min(4, p.warp_carrier));
+    float* cl = kind == 1 ? dl : rl;
+    float* cr = kind == 1 ? dr : rr;
+    float carrier[kChunk], mod[kChunk], warped[kChunk];
+    for (int i = 0; i < kChunk; ++i) { carrier[i] = 0.5f * (cl[i] + cr[i]); mod[i] = 0.5f * (bl[i] + br[i]); }
+    warp.render(kind, carrier, mod, warped, kChunk, p.warp_algo, p.warp_timbre, p.warp_drive, p.warp_note);
+    float dry = 1.0f - p.warp_mix;
+    for (int i = 0; i < kChunk; ++i) {
+      bl[i] = dry * bl[i] + p.warp_mix * warped[i];
+      br[i] = dry * br[i] + p.warp_mix * warped[i];
+      if (kind <= 1) { cl[i] *= dry; cr[i] *= dry; }            // an internal carrier has no dry part
+    }
+  }
+
   void render_samples(float* l, float* r) {
     for (auto& s : samples) {
       for (int i = 0; i < kChunk && s.pos < s.data.size(); ++i, ++s.pos) {
@@ -466,8 +499,24 @@ struct Engine {
     if (p.grain_level > 0) { grain_clock += rate * kChunk / kRate; grains += long(grain_clock); grain_clock -= long(grain_clock); }
   }
 
+  // MODS: one control-rate step, then sweep the targeted settings around their knobs.
+  void apply_mods() {
+    bool any = false;
+    for (int k = 0; k < kModLanes; ++k) any |= p.mod_target[k] > 0 && p.mod_depth[k] != 0;
+    if (!any) return;
+    mods.step(p.mod_mode, p.mod_rate, p.mod_shape, p.mod_slope, p.mod_smooth, p.mod_shift);
+    for (int k = 0; k < kModLanes; ++k) {
+      float* slot = mod_slot(p, p.mod_target[k]);
+      if (!slot) continue;
+      bool bipolar = p.mod_target[k] == 3;
+      float lo = bipolar ? -1.0f : 0.0f;
+      *slot = std::max(lo, std::min(1.0f, *slot + (bipolar ? 2 : 1) * 0.5f * p.mod_depth[k] * mods.out[k]));
+    }
+  }
+
   void render_chunk(int16_t* out) {
     apply_staging();
+    apply_mods();
     float balls_l[kChunk]{}, balls_r[kChunk]{}, rings_l[kChunk]{}, rings_r[kChunk]{};
     render_resonator(balls_l, balls_r);
     render_synth(balls_l, balls_r);
@@ -482,14 +531,33 @@ struct Engine {
     for (int k = 0; k < rings_live; ++k)
       ring[k].render(rings_l, rings_r, kChunk, std::max(0, std::min(4, p.ring_timbre)),
                      0.3f * p.ring_level, 0.2f + 0.2f * k);
+    float drums_l[kChunk]{}, drums_r[kChunk]{};
+    drums.render(drums_l, drums_r, kChunk, p.drum_play != 0, p.drum_bpm, p.drum_x, p.drum_y, p.drum_chaos,
+                 p.drum_density, p.drum_level, p.drum_tone, p.drum_decay, p.drum_note);
+    render_warp(balls_l, balls_r, rings_l, rings_r, drums_l, drums_r);
     float src_l[kChunk], src_r[kChunk];
-    for (int i = 0; i < kChunk; ++i) {
-      src_l[i] = (p.grain_source != 2 ? balls_l[i] : 0) + (p.grain_source != 1 ? rings_l[i] : 0);
-      src_r[i] = (p.grain_source != 2 ? balls_r[i] : 0) + (p.grain_source != 1 ? rings_r[i] : 0);
+    for (int i = 0; i < kChunk; ++i) {        // ALL feeds the grains the drums too
+      src_l[i] = (p.grain_source != 2 ? balls_l[i] : 0) + (p.grain_source != 1 ? rings_l[i] : 0)
+                 + (p.grain_source == 0 ? drums_l[i] : 0);
+      src_r[i] = (p.grain_source != 2 ? balls_r[i] : 0) + (p.grain_source != 1 ? rings_r[i] : 0)
+                 + (p.grain_source == 0 ? drums_r[i] : 0);
     }
     float mix_l[kChunk], mix_r[kChunk];
-    for (int i = 0; i < kChunk; ++i) { mix_l[i] = balls_l[i] + rings_l[i]; mix_r[i] = balls_r[i] + rings_r[i]; }
-    render_clouds(src_l, src_r, mix_l, mix_r);
+    for (int i = 0; i < kChunk; ++i) {
+      mix_l[i] = balls_l[i] + rings_l[i] + drums_l[i];
+      mix_r[i] = balls_r[i] + rings_r[i] + drums_r[i];
+    }
+    if (p.grain_mode == kScatterMode) {
+      float wet_l[kChunk]{}, wet_r[kChunk]{};
+      if (p.grain_level > 0)
+        scatter.render(src_l, src_r, wet_l, wet_r, kChunk, p.grain_density, p.grain_size, p.grain_position,
+                       p.grain_texture, p.grain_pitch, p.grain_spread, p.grain_feedback, p.grain_freeze != 0);
+      for (int i = 0; i < kChunk; ++i) { mix_l[i] += p.grain_level * wet_l[i]; mix_r[i] += p.grain_level * wet_r[i]; }
+      float rate = std::fabs(p.grain_density) * 40.0f;           // visual sparks only
+      if (p.grain_level > 0) { grain_clock += rate * kChunk / kRate; grains += long(grain_clock); grain_clock -= long(grain_clock); }
+    } else {
+      render_clouds(src_l, src_r, mix_l, mix_r);
+    }
 
     clouds::FloatFrame frames[kChunk];
     for (int i = 0; i < kChunk; ++i) { frames[i].l = mix_l[i]; frames[i].r = mix_r[i]; }
@@ -594,6 +662,21 @@ float tc_seq_next(void* h, float deja_vu, int length) {
   s->sequence.set_deja_vu(deja_vu);
   s->sequence.set_length(length);
   return s->sequence.NextValue(false, 0.0f);
+}
+
+// The four MODS lanes' latest values (-1..1), for the meters and for TILT.
+void tc_mods(void* h, float* out) {
+  Engine* e = static_cast<Engine*>(h);
+  for (int k = 0; k < kModLanes; ++k) out[k] = e->mods.out[k];
+}
+
+// DRUMS: the step playing now (0..31), and the map's levels at x, y (3 parts x 32 steps).
+int tc_drum_step(void* h) { return static_cast<Engine*>(h)->drums.step; }
+
+void tc_drum_levels(void* h, float x, float y, uint8_t* out) {
+  Engine* e = static_cast<Engine*>(h);
+  for (int part = 0; part < kDrumParts; ++part)
+    for (int s = 0; s < kDrumSteps; ++s) out[part * kDrumSteps + s] = e->drums.map.read(part, s, x, y);
 }
 
 long tc_grains(void* h) { return static_cast<Engine*>(h)->grains; }

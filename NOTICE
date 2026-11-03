@@ -7,7 +7,10 @@ see native/vendor/EURORACK_COMMIT) and the stmlib support library
 (https://github.com/pichenettes/stmlib, see native/vendor/STMLIB_COMMIT):
 the resonator (rings/), the granular processor and reverb (clouds/), the
 synth voice with its low-pass gate (plaits/), the physical-modelling voice
-(elements/), the deja-vu random sequence (marbles/), and stmlib's
+(elements/), the deja-vu random sequence (marbles/), the function generator
+(tides2/), the cross-modulator and vocoder (warps/), the newer granular
+processor (beads/), the arpeggiator (plaits/dsp/engine2/arpeggiator.h, also
+ported to Python in tombola/arp.py), and stmlib's
 dsp/utils/fft helpers. Only the DSP parts are included; hardware,
 firmware and UI files were removed.
 

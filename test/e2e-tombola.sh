@@ -78,6 +78,21 @@ SCREEN4=$(tmux capture-pane -p -t "$SESS")
 for label in CLOCK CHANGE JITTER CHANCE LENGTH "DEJA VU" SPREAD BIAS CHORD; do
     grep -q "$label" <<<"$SCREEN4" || fail "CHORDS page is missing label $label"
 done
+
+# Tab past GRAINS to the three newer pages: DRUMS (pattern bar), WARP, MODS.
+check_page() {   # $1 page name, rest: labels it must show
+    local page=$1 screen; shift
+    tmux send-keys -t "$SESS" Tab
+    sleep 0.5
+    screen=$(tmux capture-pane -p -t "$SESS")
+    for label in "$page" "$@"; do
+        grep -q "$label" <<<"$screen" || fail "$page page is missing $label"
+    done
+}
+check_page GRAINS DENSITY TEXTURE
+check_page DRUMS BPM "MAP X" KICK SNARE HATS STOP
+check_page WARP CARRIER ALGO MIX XFADE VOCODER
+check_page MODS RATE SHAPE SHIFT "TO 1" DEPTH
 sleep 3
 tmux send-keys -t "$SESS" q
 for _ in $(seq 1 20); do [ -f "$WORK/exit" ] && break; sleep 0.25; done

@@ -1,7 +1,7 @@
 # Builds the tombola audio core from the vendored DSP (MIT, see ../NOTICE).
 V        = vendor
 CXXFLAGS = -O2 -fPIC -DTEST -include cstdio -msse2 -Wno-unused-variable -Wno-unused-parameter -I$(V)/eurorack -I$(V)
-SOURCES  = tombola_core.cc \
+SOURCES  = tombola_core.cc mods.cc warp.cc scatter.cc \
            $(V)/eurorack/rings/dsp/fm_voice.cc $(V)/eurorack/rings/dsp/part.cc \
            $(V)/eurorack/rings/dsp/resonator.cc $(V)/eurorack/rings/dsp/string.cc \
            $(V)/eurorack/rings/dsp/string_synth_part.cc $(V)/eurorack/rings/resources.cc \
@@ -56,10 +56,18 @@ SOURCES  = tombola_core.cc \
            $(V)/eurorack/plaits/dsp/fm/dx_units.cc \
            $(V)/eurorack/elements/dsp/string.cc \
            $(V)/eurorack/elements/resources.cc \
-           $(V)/eurorack/marbles/resources.cc
+           $(V)/eurorack/marbles/resources.cc \
+           $(V)/eurorack/tides2/poly_slope_generator.cc $(V)/eurorack/tides2/resources.cc \
+           $(V)/eurorack/warps/dsp/filter_bank.cc $(V)/eurorack/warps/dsp/modulator.cc \
+           $(V)/eurorack/warps/dsp/oscillator.cc $(V)/eurorack/warps/dsp/vocoder.cc \
+           $(V)/eurorack/warps/resources.cc \
+           $(V)/eurorack/beads/dsp/delay_clock.cc $(V)/eurorack/beads/dsp/delay_controller.cc \
+           $(V)/eurorack/beads/dsp/mu_law.cc $(V)/eurorack/beads/dsp/processor.cc \
+           $(V)/eurorack/beads/dsp/trigger_generator.cc $(V)/eurorack/beads/resources.cc
+HEADERS  = synth_voice.h mods.h drums.h warp.h scatter.h
 TARGET   = ../tombola/libtombola_core.so
 
-$(TARGET): $(SOURCES) makefile
+$(TARGET): $(SOURCES) $(HEADERS) makefile
 	$(CXX) -shared $(CXXFLAGS) $(SOURCES) -o $@
 
 clean:

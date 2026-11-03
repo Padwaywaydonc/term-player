@@ -5,7 +5,8 @@ from dataclasses import dataclass
 
 from music import KEYS, SCALES, SHAPES
 from rings import RATIOS
-from native import ENGINES, EXCITERS
+from arp import MODES as ARP_MODES
+from native import ENGINES, EXCITERS, GRAIN_MODES, MOD_MODES, WARP_CARRIERS
 from synth import INSTRUMENTS, RING_TIMBRES, Mixer
 from ui import VISUALS
 
@@ -27,23 +28,29 @@ PHYSICAL = "PHYSICAL"            # balls strike, bow or blow a physically modell
 BALL_INSTRUMENTS = INSTRUMENTS + (RESONATOR, SYNTH, PHYSICAL)
 RING_TONES = tuple(RING_TIMBRES) + ENGINES                   # built-in timbres, then the synth engines
 RESONATOR_MODELS = ("MODAL", "SYMPATH", "STRING", "FM", "SYMP-Q", "STR+REV")
-GRAIN_MODES = ("GRANULAR", "STRETCH", "DELAY", "SPECTRAL")
 # Values renamed since earlier versions: saved settings and undo history are migrated on load.
 RENAMED = {"instr": {"RINGS": RESONATOR}, "chord": {"MARBLES": RANDOM}}
 # With INSTR on RESONATOR the BALLS page swaps ATTACK/RELEASE for the resonator's controls.
-RESONATOR_PAGE = (("key", "scale", "instr", "rmodel", "shape", "visual", "window"),
+# MODS lanes can sweep these (OFF first; the order is the native core's mod_slot()).
+MOD_TARGETS = ("OFF", "GRAIN POS", "GRAIN SIZE", "DENSITY", "TEXTURE", "GRAIN LVL",
+               "SYN TIMBRE", "SYN HARM", "SYN MORPH", "RES BRIGHT", "RES STRUCT", "RES POS",
+               "PHY GEOM", "PHY BRIGHT", "RING TIMB", "RING MORPH", "PAD", "REVERB",
+               "WARP ALGO", "WARP TIMB", "DRUM X", "DRUM Y", "CHAOS", "TILT")
+# WARP's ALGO knob sweeps through these (the last stretch is the vocoder).
+WARP_ALGOS = ("XFADE", "FOLD", "RING-A", "RING-D", "XOR", "COMPARE", "VOCODER")
+RESONATOR_PAGE = (("key", "scale", "instr", "rmodel", "arp", "shape", "visual", "window"),
                   ("balls", "grav", "rot", "bounce", "octave", "rstruct", "rbright", "rdamp", "rpos", "rpoly",
                    "reverb", "grain", "vol"))
-SYNTH_PAGE = (("key", "scale", "instr", "sengine", "shape", "visual", "window"),
+SYNTH_PAGE = (("key", "scale", "instr", "sengine", "arp", "shape", "visual", "window"),
               ("balls", "grav", "rot", "bounce", "octave", "sharm", "stimb", "smorph", "sdecay", "scolour",
                "reverb", "grain", "vol"))
-PHYSICAL_PAGE = (("key", "scale", "instr", "pexc", "shape", "visual", "window"),
+PHYSICAL_PAGE = (("key", "scale", "instr", "pexc", "arp", "shape", "visual", "window"),
                  ("balls", "grav", "rot", "bounce", "octave", "pgeo", "pbright", "pdamp", "ppos", "pspace",
                   "reverb", "grain", "vol"))
 RING_SYNTH_KNOBS = ("rharm", "rtimb", "rmorph")              # shown on RINGS when INSTR is a synth engine
 # Each page lists (side settings, knobs). Shared settings sit on both pages.
 PAGES = {
-    "BALLS": (("key", "scale", "instr", "attack", "release", "shape", "visual", "window"),
+    "BALLS": (("key", "scale", "instr", "arp", "attack", "release", "shape", "visual", "window"),
               ("balls", "grav", "rot", "bounce", "octave", "reverb", "grain", "vol")),
     "RINGS": (("key", "scale", "tone", "chord", "ratio", "visual", "window"),
               ("rings", "moons", "speed", "tilt", "roct", "bed", "floor", "reverb", "grain", "rvol")),
@@ -51,9 +58,16 @@ PAGES = {
                ("change", "jitter", "chance", "length", "deja", "cspread", "cbias", "roct")),
     "GRAINS": (("key", "scale", "source", "gmode", "freeze", "visual", "window"),
                ("grain", "density", "size", "position", "pitch", "spread", "texture", "feedback", "reverb")),
+    "DRUMS": (("key", "scale", "dplay", "visual", "window"),
+              ("dbpm", "dx", "dy", "dchaos", "dkick", "dsnare", "dhats", "dtone", "ddecay", "dvol")),
+    "WARP": (("key", "scale", "wcar", "visual", "window"),
+             ("walgo", "wtimb", "wdrive", "wmix")),
+    "MODS": (("key", "scale", "mmode", "visual", "window"),
+             ("mrate", "mshape", "mslope", "msmooth", "mshift", "mto1", "mdep1", "mto2", "mdep2",
+              "mto3", "mdep3", "mto4", "mdep4")),
 }
-# r = respawn with fresh random settings, kept in ranges that stay musical.
-# Both VOLs and VISUAL are left alone so a reroll never blasts or changes the look.
+# r = fresh random settings for the current page, kept in ranges that stay musical.
+# Only keys listed here are rolled; VOLs, VISUAL and shared settings never are.
 RANDOM_RANGES = {
     "key": None, "scale": None, "instr": None, "shape": None,
     "attack": (1, 20), "release": (0.8, 3.0), "balls": (2, 6), "grav": (10, 60),
@@ -68,8 +82,32 @@ RANDOM_RANGES = {
     "clock": None, "jitter": (0, 40), "chance": (60, 100), "length": (4, 12), "deja": (0, 60),
     "cspread": (10, 90), "cbias": (30, 90),
     "density": (-60, 80), "size": (40, 300), "position": (0, 80), "pitch": (-12, 12), "spread": (0, 70),
-    "texture": (20, 100), "feedback": (0, 40), "source": None, "roct": (0, 2),
+    "texture": (20, 100), "feedback": (0, 40), "source": None, "roct": (0, 2), "arp": None,
+    "dbpm": (80, 140), "dx": None, "dy": (0, 70), "dchaos": (0, 40), "dkick": (30, 80), "dsnare": (20, 70),
+    "dhats": (20, 80), "dtone": (20, 80), "ddecay": (20, 80),
+    "wcar": None, "walgo": None, "wtimb": None, "wdrive": None,
+    "mmode": None, "mrate": (0.05, 2), "mshape": None, "mslope": None, "msmooth": None, "mshift": None,
+    "mto1": None, "mto2": None, "mto3": None, "mto4": None, "mdep1": (-60, 60), "mdep2": (-60, 60),
+    "mdep3": (-60, 60), "mdep4": (-60, 60),
 }
+
+
+def _page_keys(page):
+    """Every key a page can show, whatever INSTR or TONE is set to."""
+    layouts = [PAGES[page]] + {"BALLS": [RESONATOR_PAGE, SYNTH_PAGE, PHYSICAL_PAGE],
+                               "RINGS": [((), RING_SYNTH_KNOBS)]}.get(page, [])
+    return {k for side, knobs in layouts for k in side + knobs}
+
+
+# Settings on more than one page (KEY, SCALE, VISUAL, REVERB, ...) are global: r never rolls them.
+SHARED = {k for k in set().union(*map(_page_keys, PAGES))
+          if sum(k in _page_keys(page) for page in PAGES) > 1}
+
+
+def random_keys(page):
+    """The RANDOM_RANGES keys r rolls on this page: its own settings only."""
+    own = _page_keys(page) - SHARED
+    return [k for k in RANDOM_RANGES if k in own]
 
 
 @dataclass
@@ -173,6 +211,34 @@ def make_params():
         _p("texture", "TEXTURE", range(0, 101, 5), 70, "{}%"),      # square -> triangle -> smooth
         _p("feedback", "FEEDBACK", range(0, 91, 5), 0, "{}%"),
         _p("floor", "FLOOR", range(0, 101, 5), 15, "{}%"),      # ring volume with its moon at its lowest: 0 silent .. 100 drone
+        _p("arp", "ARP", ARP_MODES, "OFF"),                     # hits walk the chord (1-3-5-7, two octaves)
+        # DRUMS page: a drum-pattern map (X/Y) and three drum voices
+        _p("dplay", "PLAY", ("OFF", "ON"), "OFF"),
+        _p("dbpm", "BPM", range(60, 181, 4), 112),
+        _p("dx", "MAP X", range(0, 101, 5), 20, "{}%"),          # straight .. broken
+        _p("dy", "MAP Y", range(0, 101, 5), 30, "{}%"),          # sparse .. busy
+        _p("dchaos", "CHAOS", range(0, 101, 5), 10, "{}%"),      # random extra hits per bar
+        _p("dkick", "KICK", range(0, 101, 5), 60, "{}%"),        # density per part: 0 silent
+        _p("dsnare", "SNARE", range(0, 101, 5), 50, "{}%"),
+        _p("dhats", "HATS", range(0, 101, 5), 60, "{}%"),
+        _p("dtone", "TONE", range(0, 101, 5), 50, "{}%"),
+        _p("ddecay", "DECAY", range(0, 101, 5), 50, "{}%"),
+        _p("dvol", "VOL", range(0, 101, 5), 60, "{}%"),
+        # WARP page: the balls cross-modulate a carrier
+        _p("wcar", "CARRIER", WARP_CARRIERS, "RINGS"),           # rings, drums, or an oscillator at the chord root
+        _p("walgo", "ALGO", range(0, 96, 5), 25, "{}%"),         # see WARP_ALGOS; the top is the vocoder
+        _p("wtimb", "TIMBRE", range(0, 101, 5), 50, "{}%"),
+        _p("wdrive", "DRIVE", range(0, 101, 5), 50, "{}%"),      # input saturation (character, not level)
+        _p("wmix", "MIX", range(0, 101, 5), 0, "{}%"),           # 0 = off
+        # MODS page: four slow modulation lanes
+        _p("mmode", "MODE", MOD_MODES, "PHASE"),                 # lanes phase-shifted / at other rates / panned
+        _p("mrate", "RATE", (0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1, 1.5, 2, 3, 5, 8), 0.2, "{} HZ"),
+        _p("mshape", "SHAPE", range(0, 101, 5), 50, "{}%"),
+        _p("mslope", "SLOPE", range(0, 101, 5), 50, "{}%"),      # rise vs fall
+        _p("msmooth", "SMOOTH", range(0, 101, 5), 50, "{}%"),
+        _p("mshift", "SHIFT", range(0, 101, 5), 50, "{}%"),      # how the four lanes differ
+        *(_p(f"mto{k}", f"TO {k}", MOD_TARGETS, "OFF") for k in range(1, 5)),
+        *(_p(f"mdep{k}", "DEPTH", range(-100, 101, 10), 50, "{:+d}%") for k in range(1, 5)),
     ]
 
 
