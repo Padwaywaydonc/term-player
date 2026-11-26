@@ -33,7 +33,7 @@ static beads::RandomizedParameter knob(float base, float random) {
 
 void Scatter::render(const float* in_l, const float* in_r, float* out_l, float* out_r, int n,
                      float density, float size, float position, float texture, float pitch,
-                     float spread, float feedback, bool freeze) {
+                     float spread, float feedback, bool freeze, float wash) {
   beads::Parameters p;
   p.time = knob(position, 0.5f * spread);
   p.size = knob(std::min(0.95f, size), 0.4f * spread);    // 0.98+: switches to delay mode
@@ -46,7 +46,7 @@ void Scatter::render(const float* in_l, const float* in_r, float* out_l, float* 
   beads::Processor::MixParameters m;
   m.feedback = kScatterFeedbackMax * feedback;
   m.dry_wet = 1.0f;
-  m.reverb_amount = 0.0f;
+  m.reverb_amount = wash;
   m.output_gate = false;
   bool freezes[kScatterBlock];
   std::fill(freezes, freezes + kScatterBlock, freeze);

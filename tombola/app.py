@@ -12,25 +12,35 @@ import time
 import tty
 
 from arp import Arpeggiator
+from clock import BEATS_PER_BAR, QUANTS, RATIOS, Clock
 from music import KEYS, SHAPES, pad_note
 from marbles import ChordSequencer, LoopSequencer
 import native
 from params import (CONFIG, DEGREES, HISTORY_MAX, PAGES, PROGRESSIONS, RANDOM, RANDOM_RANGES, SHARED, random_keys,  # noqa: F401
                     MOD_TARGETS, PHYSICAL, RESONATOR, RESONATOR_MODELS, SYNTH, WARP_ALGOS,
-                    apply_snapshot, load_history, load_params, make_params, page_params, save_params,
+                    apply_snapshot, load_history, load_params, load_radio, load_seed, make_params, page_params, save_params,
                     snapshot)
 from physics import BALL_SIZES, World
+from radio import Radio
 from backdrop import FPS as BACKDROP_FPS, Backdrop, scene_commands
 from resonator import STRENGTHS, RenderPool, strength_step
 from rings import TAU, Rings
 from native import ENGINES, EXCITERS, MOD_MODES, WARP_CARRIERS
 from synth import RING_TIMBRES, Mixer
 import ui
+from explain import explain
+import presets
 
 PHYS_DT = 1 / 120
 PY_STANDIN = {SYNTH: "BELL", PHYSICAL: "MARIMBA"}             # Python engine stand-ins
 PY_MODEL = {"MODAL": "MODAL", "SYMPATH": "SYMPATH", "STRING": "STRING",       # Python fallback stand-ins
             "FM": "MODAL", "SYMP-Q": "SYMPATH", "STR+REV": "STRING"}
+
+
+def eval_bars(text):
+    """A CYCLE length like "1/4" or "8" as a number of bars."""
+    num, _, den = text.partition("/")
+    return float(num) / float(den or 1)
 
 
 def make_mixer():
@@ -50,6 +60,7 @@ ARP_RANGE = 2                    # ... across two octaves
 DRUM_ROOT = 24                   # kick tuned to the key's root in octave 1 (33..62 Hz)
 TILT_SWING = 15                  # degrees a full-depth MODS lane tilts the rings either way
 MOD_LANES = 4
+TOAST_S = 2.5                    # how long "SAVED PRESET 3" stays on the bottom line
 
 
 class Engine:
@@ -72,9 +83,16 @@ class Engine:
         self.rng = random.Random()
         self.arp = Arpeggiator(range_=ARP_RANGE, rng=self.rng)
         self.tilt_lanes = []                     # (lane, depth) MODS lanes aimed at TILT
+        self.clock = Clock(self.mixer if isinstance(self.mixer, native.NativeMixer) else None)
+        self.last_bar = None                     # BARS chord clock: bar of the last check
+        self.radio = Radio(self.mixer)
+        self.radio_query = ""                    # the RADIO tab's last search
         lib = native.load() if isinstance(self.mixer, native.NativeMixer) else None
         self.sequencer = (LoopSequencer(lambda seed: native.RandomSource(lib, seed)) if lib
                           else ChordSequencer(rng=self.rng))
+        self.preset_dir = presets.PRESET_DIR
+        self.loop_seed = None
+        self.reseed_loop(new_seed())
         self._warm_jobs = []
         self._warm_wake = threading.Event()
         self._warm_thread = None
@@ -96,12 +114,14 @@ class Engine:
         self.mixer.wet = self.v("reverb") / 100
         self.mixer.volume = 1.0                  # balls and rings each have their own VOL
         c = self.mixer.cloud
-        c.level, c.density = self.v("grain") / 100, self.v("density") / 100
+        c.level = self.v("grain") / 100 if self.native or self.tab_on("GRAINS") else 0.0   # native fades it
+        c.density = self.v("density") / 100
         c.size, c.position, c.pitch = self.v("size") / 1000, self.v("position") / 100, self.v("pitch")
         c.spread, c.texture, c.feedback = self.v("spread") / 100, self.v("texture") / 100, self.v("feedback") / 100
+        c.wash = self.v("gwash") / 100              # 48K only: the grain engine's own reverb
         c.freeze = self.v("freeze") == "ON"
         self.mixer.grain_source = self.v("source")
-        self.mixer.bed = self.v("bed") / 100 * 0.45 * self.ring_vol() if self.on else 0.0
+        self.mixer.bed = self.v("bed") / 100 * 0.45 * self.ring_vol() if self.tab_on("RINGS") else 0.0
         tone = self.v("tone")
         self.mixer.ring_timbre = tone if tone in RING_TIMBRES else "WARM"   # engines: native only
         c.mode = self.v("gmode")
@@ -121,7 +141,8 @@ class Engine:
         if self.native:
             self.apply_native_extras()
         self.tilt_lanes = [(k, self.v(f"mdep{k + 1}") / 100) for k in range(MOD_LANES)
-                           if self.v(f"mto{k + 1}") == "TILT"] if self.native else []
+                           if self.v(f"mto{k + 1}") == "TILT"] if self.native and self.tab_on("MODS") else []
+        self.sync_radio()
         q = self.sequencer
         q.deja, q.spread, q.bias = self.v("deja") / 100, self.v("cspread") / 100, self.v("cbias") / 100
         if q.length != self.v("length"):
@@ -131,16 +152,67 @@ class Engine:
         """DRUMS, WARP and MODS: native only (the Python engine has none of them)."""
         pc = lambda key: self.v(key) / 100
         m = self.mixer
-        m.drums.update(play=int(self.on and self.v("dplay") == "ON"), bpm=float(self.v("dbpm")),
+        m.drums.update(play=int(self.tab_on("DRUMS")),
                        x=pc("dx"), y=pc("dy"), chaos=pc("dchaos"),
                        density=(pc("dkick"), pc("dsnare"), pc("dhats")), level=pc("dvol") * 1.2,
                        tone=pc("dtone"), decay=pc("ddecay"), note=float(DRUM_ROOT + KEYS.index(self.v("key"))))
         m.warp.update(carrier=WARP_CARRIERS.index(self.v("wcar")), algo=pc("walgo"), timbre=pc("wtimb"),
                       drive=0.6 + 0.4 * pc("wdrive"), mix=pc("wmix"))     # below 0.6 the vocoder goes silent
+        mods_on = self.tab_on("MODS")
         m.mods.update(mode=MOD_MODES.index(self.v("mmode")), rate=float(self.v("mrate")),
                       shape=pc("mshape"), slope=pc("mslope"), smooth=pc("msmooth"), shift=pc("mshift"),
-                      targets=tuple(MOD_TARGETS.index(self.v(f"mto{k}")) for k in range(1, MOD_LANES + 1)),
+                      targets=tuple(MOD_TARGETS.index(self.v(f"mto{k}")) if mods_on else 0
+                                    for k in range(1, MOD_LANES + 1)),
                       depths=tuple(pc(f"mdep{k}") for k in range(1, MOD_LANES + 1)))
+        m.clock.update(bpm=float(self.v("bpm")), ball_ratio=self.ratio("BALLS"), drum_ratio=self.ratio("DRUMS"),
+                       mod_ratio=self.ratio("MODS"), quant=QUANTS[self.v("quant")],
+                       mod_cycle=(BEATS_PER_BAR * eval_bars(self.v("mbars")) if self.v("msync") == "ON" else 0.0))
+        m.buses.update({bus: float(self.tab_on(page)) for bus, page in
+                        (("balls", "BALLS"), ("rings", "RINGS"), ("grains", "GRAINS"), ("drums", "DRUMS"),
+                         ("warp", "WARP"), ("radio", "RADIO"))})
+        m.radio_level = pc("radvol")
+
+    def sync_radio(self):
+        """Start the radio when its tab is on (last search, or the track it was on); stop it when off."""
+        radio = getattr(self, "radio", None)
+        if radio is None:
+            return
+        if not self.tab_on("RADIO"):
+            if radio.playing:
+                radio.stop()
+        elif radio.status == "IDLE" and not getattr(self, "_radio_manual", False):
+            if radio.results:
+                radio.play()
+            elif self.radio_query:
+                radio.search(self.radio_query, self.v("rsrc"))
+
+    def search_radio(self, query):
+        """A new RADIO search; switches the tab on."""
+        self.radio_query = query.strip()[:120]
+        self.radio.results = []
+        self.radio.stop()
+        self.radio_on()
+
+    def radio_on(self):
+        """Playing something on the radio switches its tab on."""
+        if self.v("on_radio") != "ON":
+            self.params["on_radio"].index = 1
+            self._radio_manual = True            # the caller starts the track: don't autostart one too
+            try:
+                self.apply()
+            finally:
+                self._radio_manual = False
+
+    def tab_on(self, page):
+        """Is this tab sounding: its own switch (o), and the master on/off (space)."""
+        return self.on and self.v(f"on_{page.lower()}") == "ON"
+
+    def ratio(self, page):
+        """The tab's clock as a multiple of the master (CLK)."""
+        return RATIOS[self.v(f"clk_{page.lower()}")]
+
+    def tab_beats(self, page):
+        return self.clock.beats * self.ratio(page)
 
     def ball_vol(self):
         return self.v("vol") / 100 * 1.2
@@ -219,10 +291,14 @@ class Engine:
         self.prewarm()
 
     def undo(self):
-        """Back to the settings before the last r. Returns False when there is nothing to undo."""
+        """Back to the settings before the last r (or preset load). Returns False when there is
+        nothing to undo. The tabs' on/off switches stay as they are."""
         if not self.history:
             return False
-        apply_snapshot(self.params.values(), self.history.pop())
+        snap = self.history.pop()
+        apply_snapshot(self.params.values(), {k: v for k, v in snap.items() if not k.startswith("on_")})
+        if isinstance(snap.get("loop_seed"), int) and snap["loop_seed"] != self.loop_seed:
+            self.reseed_loop(snap["loop_seed"])
         self.apply()
         self.prewarm()
         return True
@@ -247,6 +323,7 @@ class Engine:
     def close(self):
         if self._pool:
             self._pool.close()
+        self.radio.close()
 
     @property
     def native(self):
@@ -298,7 +375,11 @@ class Engine:
                 self.ball_sound(*job)
 
     def step(self, dt):
+        dbeats = self.clock.advance(dt, self.v("bpm")) if self.on else 0.0
+        balls_on = self.tab_on("BALLS")
         for hit in self.world.step(dt):
+            if not balls_on:                     # off: the balls still bounce, silently
+                continue
             strength = min(1.0, 0.08 + hit.speed / 2.0)               # hard hits louder (and brighter)
             midi = self.hit_midi(hit.edge, hit.octave)
             if self.native and self.v("instr") in (RESONATOR, SYNTH, PHYSICAL):
@@ -320,10 +401,16 @@ class Engine:
         if self.native:
             self.mixer.warp["note"] = float(self.chord(self.chord_step)[1])   # the oscillator plays the root
         before = self.outer_moons()
-        self.rings.step(dt)
-        if self.clock_tick(dt, before) and not self.hold and self.rng.random() < self.v("chance") / 100:
+        if self.v("rsync") == "ON":
+            r = self.ratio("RINGS")
+            self.rings.step_synced(dt, dbeats * r, self.clock.beats * r, BEATS_PER_BAR * self.v("rbars"))
+        else:
+            self.rings.step(dt)
+        if (self.clock_tick(dt, before) and not self.hold and self.tab_on("CHORDS")
+                and self.rng.random() < self.v("chance") / 100):
             self.advance_chord()
-        self.mixer.set_rings(self.ring_targets())
+        rings_on = self.tab_on("RINGS")
+        self.mixer.set_rings([(m, g if rings_on else 0.0) for m, g in self.ring_targets()])
 
     def moving(self):
         return self.v("chord") in PROGRESSIONS or self.v("chord") == RANDOM
@@ -337,6 +424,11 @@ class Engine:
         highest point. TIME: CHANGE seconds have passed, varied by JITTER."""
         if not self.moving():
             return False
+        if self.v("clock") == "BARS":
+            bar = int(self.tab_beats("CHORDS") // (BEATS_PER_BAR * self.v("cbars")))
+            ticked = self.last_bar is not None and bar != self.last_bar
+            self.last_bar = bar
+            return ticked
         if self.v("clock") == "MOON" and before:
             top = self.rings.top_angle()
             after = self.outer_moons()
@@ -360,9 +452,44 @@ class Engine:
             self.chord_step += 1
 
     def regenerate(self):
-        """g: a brand-new random chord loop."""
-        self.sequencer.regenerate()
+        """g: a brand-new random chord loop (with its own seed, so a preset can bring it back)."""
+        self.reseed_loop(new_seed())
+
+    def reseed_loop(self, seed):
+        """The RANDOM chord loop drawn from seed, and the coin tosses (CHANCE, JITTER, ARP
+        RANDOM) restarted from it: the same seed always plays the same loop."""
+        self.loop_seed = seed
+        self.rng.seed(seed)
+        self.sequencer.reseed(seed)
         self.sequencer.current = self.sequencer.loop[0]
+        self.chord_step = 0
+
+    def save_preset(self, slot):
+        presets.save(slot, snapshot(self.params.values()), self.loop_seed, self.radio_query,
+                     self.preset_dir)
+
+    def load_preset(self, slot):
+        """Settings and chord loop from a slot; u undoes it. Returns False when the slot is empty."""
+        saved = presets.load(slot, self.preset_dir)
+        if saved is None:
+            return False
+        settings, seed, query = saved
+        self.history = (self.history + [{**snapshot(self.params.values()),
+                                         "loop_seed": self.loop_seed}])[-HISTORY_MAX:]
+        apply_snapshot(self.params.values(), settings)
+        if seed:
+            self.reseed_loop(seed)
+        if query and query != self.radio_query:     # a different station: search it when RADIO is on
+            self.radio_query = query
+            self.radio.results = []
+            self.radio.stop()
+        self.apply()
+        self.prewarm()
+        return True
+
+
+def new_seed():
+    return random.randint(1, presets.MAX_SEED)
 
 
 # Direct hotkeys: (param, step) cycles a param, (param, "=", index) jumps to a value.
@@ -372,12 +499,16 @@ KEYMAP = {b"\x1b[C": "right", b"\x1b[D": "left", b"\x1b[A": "up", b"\x1b[B": "do
           b"s": ("shape", 1), b"S": ("shape", -1), b"n": ("key", 1), b"N": ("key", -1),
           b"c": ("scale", 1), b"C": ("scale", -1), b"i": ("instr", 1), b"I": ("instr", -1),
           b"v": ("visual", 1), b"w": ("window", 1), b"f": ("freeze", 1),
-          b"g": "regenerate", b"x": "hold",
+          b"g": "regenerate", b"x": "hold", b"?": "help", b"o": "tab",
+          b"P": "preset_save", b"L": "preset_load",
           **{str(n).encode(): ("digit", n) for n in range(1, 10)}}
 # Digit keys mean different things per page: shape (sides 3-8) or chord degree (I-VII).
 DIGITS = {"BALLS": ("shape", lambda n: n - 3 if 3 <= n <= 8 else None),
           "RINGS": ("chord", lambda n: n - 1 if 1 <= n <= 7 else None),
-          "CHORDS": ("chord", lambda n: n - 1 if 1 <= n <= 7 else None)}
+          "CHORDS": ("chord", lambda n: n - 1 if 1 <= n <= 7 else None),
+          "WARP": ("wcar", lambda n: n - 1 if 1 <= n <= len(WARP_CARRIERS) else None)}
+# ... or jump the cursor: 1-4 on MODS selects that mover's TO setting.
+FOCUS_DIGITS = {"MODS": lambda n: f"mto{n}" if 1 <= n <= MOD_LANES else None}
 
 
 def parse_keys(data):
@@ -405,6 +536,13 @@ class Menu:
         self.pages = list(PAGES)
         self.page = self.pages[0]
         self.cursor = {p: len(PAGES[p][0]) for p in self.pages}   # start on the first knob
+        self.help = False                        # ?: explain the selected setting
+        self.radio_list = None                   # RADIO track list when open: {"sel", "sbuf"}
+        self.pending = None                      # "save" / "load": waiting for a slot digit (P / L)
+        self.toast = None                        # (text, until): a short note on the bottom line
+
+    def say(self, text, seconds=TOAST_S):
+        self.toast = (text, time.monotonic() + seconds)
 
     def items(self):
         side, knobs = page_params(self.params, self.page)
@@ -433,6 +571,14 @@ def handle_key(k, engine, menu):
     changed = None
     if k == "quit":
         return False
+    if menu.pending:
+        preset_key(k, engine, menu)
+        return True
+    if isinstance(k, tuple) and k[0] == "digit" and menu.page in FOCUS_DIGITS:
+        key = FOCUS_DIGITS[menu.page](k[1])
+        if key:
+            menu.focus(engine.params[key])
+        return True
     if isinstance(k, tuple) and k[0] == "digit":
         if menu.page not in DIGITS:
             return True
@@ -465,10 +611,124 @@ def handle_key(k, engine, menu):
         engine.regenerate()
     elif k == "hold":
         engine.hold = not engine.hold
+    elif k == "help":
+        menu.help = not menu.help
+    elif k in ("preset_save", "preset_load"):
+        menu.pending = k[7:]
+        menu.toast = None
+    elif k == "tab":                              # this tab on / off
+        changed = engine.params[f"on_{menu.page.lower()}"]
+        changed.nudge(1)
     if changed:
         engine.apply()
         if changed.key in PREWARM_KEYS:
             engine.prewarm()
+    return True
+
+
+def preset_key(k, engine, menu):
+    """The key after P or L: a digit picks the slot, anything else cancels."""
+    action, menu.pending = menu.pending, None
+    if not (isinstance(k, tuple) and k[0] == "digit"):
+        menu.say("CANCELLED")
+        return
+    slot = k[1]
+    if action == "save":
+        engine.save_preset(slot)
+        menu.say(f"SAVED PRESET {slot}")
+    elif engine.load_preset(slot):
+        menu.say(f"LOADED PRESET {slot}  (u undoes)")
+    else:
+        menu.say(f"PRESET {slot} IS EMPTY")
+
+
+# RADIO page: play's player keys, before tombola's own (tab, o, ?, q, v, w still work).
+RADIO_KEYS = {b"\x1b[C": ("seek", 10), b"\x1b[D": ("seek", -10), b"\x1b[A": ("vol", 1), b"\x1b[B": ("vol", -1),
+              b" ": ("pause",), b"n": ("skip", 1), b"p": ("skip", -1), b"l": ("list",), b"\r": ("list",),
+              b"/": ("list",), b"s": ("source",)}
+
+
+def radio_action(act, engine, menu):
+    radio = engine.radio
+    name = act[0]
+    if name == "seek":
+        radio.seek(act[1])
+    elif name == "vol":
+        engine.params["radvol"].nudge(act[1])
+        engine.apply()
+    elif name == "pause":
+        if radio.status in ("PLAYING", "PAUSED"):
+            radio.pause()
+        elif radio.results:
+            engine.radio_on()
+            radio.play()
+    elif name == "skip" and radio.results:
+        engine.radio_on()
+        radio.skip(act[1])
+    elif name == "list":
+        menu.radio_list = {"sel": radio.index if radio.results else 0, "sbuf": ""}
+    elif name == "source":                        # like play's settings: a new source searches again
+        engine.params["rsrc"].nudge(1)
+        engine.apply()
+        if engine.radio_query:
+            engine.search_radio(engine.radio_query)
+
+
+def radio_list_key(data, i, engine, menu):
+    """One key in the open track list (play's l): arrows move, typing searches,
+    Enter plays (or searches), Esc closes. Returns the index after the key."""
+    lst, results = menu.radio_list, engine.radio.results
+    if data.startswith(b"\x1b[A", i) or data.startswith(b"\x1b[B", i):
+        step = -1 if data[i + 2:i + 3] == b"A" else 1
+        lst["sel"] = max(0, min(len(results) - 1, lst["sel"] + step)) if results else 0
+        lst["sbuf"] = ""
+        return i + 3
+    if data.startswith(b"\x1b[", i):                # other arrows / keys: ignored here
+        return i + 3
+    byte = data[i:i + 1]
+    if byte == b"\x1b":
+        menu.radio_list = None
+        return i + 1
+    if byte in (b"\r", b"\n"):
+        if lst["sbuf"].strip():
+            engine.search_radio(lst["sbuf"])
+            lst.update(sel=0, sbuf="")
+        elif results:
+            engine.radio_on()
+            engine.radio.play(lst["sel"])
+            menu.radio_list = None
+        return i + 1
+    if byte in (b"\x7f", b"\x08"):
+        lst["sbuf"] = lst["sbuf"][:-1]
+        return i + 1
+    size = 1 if data[i] < 0xC0 else 2 if data[i] < 0xE0 else 3 if data[i] < 0xF0 else 4
+    ch = data[i:i + size].decode("utf-8", "ignore")
+    if ch.isprintable() and len(lst["sbuf"]) < 120:
+        lst["sbuf"] += ch
+    return i + size
+
+
+def handle_radio_input(data, engine, menu):
+    """Keys on the RADIO page. Returns False to quit."""
+    i = 0
+    while i < len(data):
+        if menu.page != "RADIO":                   # tab moved on: the rest is ordinary keys
+            return all(handle_key(k, engine, menu) for k in parse_keys(data[i:]))
+        if menu.radio_list is not None:
+            i = radio_list_key(data, i, engine, menu)
+            continue
+        seq = None if menu.pending else next((s for s in RADIO_KEYS if data.startswith(s, i)), None)
+        if seq:
+            radio_action(RADIO_KEYS[seq], engine, menu)
+            i += len(seq)
+            continue
+        seq = next((s for s in KEYMAP if data.startswith(s, i)), None)
+        if seq is None:
+            i += 1
+            continue
+        if not handle_key(KEYMAP[seq], engine, menu):
+            return False
+        i += len(seq)
     return True
 
 
@@ -477,6 +737,11 @@ def run(output_factory, config=CONFIG):
     params = load_params(config)
     engine = Engine(params)
     engine.history = load_history(config)
+    engine.radio_query = load_radio(config)
+    seed = load_seed(config)
+    if seed:
+        engine.reseed_loop(seed)                 # the same chord loop as last time
+    engine.apply()
     engine.prewarm()
     output = output_factory(engine.mixer)
     output.start()
@@ -503,9 +768,13 @@ def run(output_factory, config=CONFIG):
             acc = min(acc + now - last, 0.25)
             last = now
             if select.select([fd], [], [], 0)[0]:
-                if not all(handle_key(k, engine, menu) for k in parse_keys(os.read(fd, 64))):
+                data = os.read(fd, 64)
+                if menu.page == "RADIO":
+                    if not handle_radio_input(data, engine, menu):
+                        return
+                elif not all(handle_key(k, engine, menu) for k in parse_keys(data)):
                     return
-                save_params(params, config, engine.history)   # every change sticks, even if killed
+                save_params(params, config, engine.history, engine.radio_query, engine.loop_seed)   # every change sticks
             while acc >= PHYS_DT:
                 if engine.on:
                     engine.step(PHYS_DT)
@@ -523,7 +792,7 @@ def run(output_factory, config=CONFIG):
         window.stop()
         output.stop()
         engine.close()
-        save_params(params, config, engine.history)
+        save_params(params, config, engine.history, engine.radio_query, engine.loop_seed)
 
 
 def sync_window(window, engine, fx, now=None):
@@ -563,13 +832,13 @@ def drum_row(engine):
         return "DRUMS 48K ONLY", [], True
     levels = engine.mixer.drum_levels(engine.v("dx") / 100, engine.v("dy") / 100)
     density = [engine.v(k) / 100 for k in ("dkick", "dsnare", "dhats")]
-    playing = engine.mixer.drum_step() // 2 if engine.v("dplay") == "ON" else -1
+    playing = engine.mixer.drum_step() // 2 if engine.tab_on("DRUMS") else -1
     cells = []
     for s in range(0, 32, 2):
         hits = [p for p in range(3) if density[p] > 0 and levels[p][s] > 255 - 255 * density[p]]
         accent = any(levels[p][s] > 192 for p in hits)
         cells.append((drum_glyph(hits), s // 2 == playing, accent))
-    return ("PLAY" if engine.v("dplay") == "ON" else "STOP"), cells, True
+    return ("PLAY" if engine.tab_on("DRUMS") else "STOP"), cells, True
 
 
 def warp_row(engine):
@@ -593,6 +862,18 @@ def mods_row(engine):
     return "MODS" if engine.native else "MODS 48K ONLY", cells
 
 
+def radio_view(engine, menu):
+    """What the RADIO page's player panel shows."""
+    radio = engine.radio
+    lst = menu.radio_list
+    return {"status": radio.missing(engine.v("rsrc")) or radio.status, "title": radio.title,
+            "index": radio.index, "count": len(radio.results), "elapsed": radio.elapsed(),
+            "duration": radio.duration(), "volume": engine.v("radvol"), "source": engine.v("rsrc"),
+            "on": engine.tab_on("RADIO"), "query": engine.radio_query,
+            "tracks": [(title, dur) for _, title, dur in radio.results],
+            "sel": lst["sel"] if lst else None, "sbuf": lst["sbuf"] if lst else None}
+
+
 BANNERS = {"CHORDS": chord_row, "DRUMS": drum_row, "WARP": warp_row, "MODS": mods_row}
 
 
@@ -606,4 +887,20 @@ def ui_state(engine, menu, output=None, fx=None, window=None):
                                           window.error if window else "") if e),
             "fx": fx, "window": engine.v("window") == "ON",
             "banner": BANNERS[menu.page](engine) if menu.page in BANNERS else None,
-            "hold": engine.hold and menu.page == "CHORDS"}
+            "radio": radio_view(engine, menu) if menu.page == "RADIO" else None,
+            "hold": engine.hold and menu.page == "CHORDS",
+            "help": explain(menu.selected()) if menu.help else None,
+            "off_pages": {p for p in menu.pages if not engine.tab_on(p)},
+            "prompt": preset_prompt(engine, menu)}
+
+
+def preset_prompt(engine, menu):
+    """Bottom-line text while P / L waits for a slot, or a fresh toast; None otherwise."""
+    if menu.pending == "save":
+        return "SAVE PRESET TO 1-9 (other key cancels)"
+    if menu.pending == "load":
+        slots = presets.used(engine.preset_dir)
+        return f"LOAD PRESET: {' '.join(map(str, slots))}" if slots else "NO PRESETS YET (P saves one)"
+    if menu.toast and time.monotonic() < menu.toast[1]:
+        return menu.toast[0]
+    return None

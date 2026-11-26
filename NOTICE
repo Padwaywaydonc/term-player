@@ -12,7 +12,9 @@ synth voice with its low-pass gate (plaits/), the physical-modelling voice
 processor (beads/), the arpeggiator (plaits/dsp/engine2/arpeggiator.h, also
 ported to Python in tombola/arp.py), and stmlib's
 dsp/utils/fft helpers. Only the DSP parts are included; hardware,
-firmware and UI files were removed.
+firmware and UI files were removed. One local change: clouds/dsp/window.h
+Window::Start() now resets done_ and half_, so the time-stretch mode's windows
+play again after their first pass (without it, STRETCH stays silent).
 
 That code is released under the MIT License:
 

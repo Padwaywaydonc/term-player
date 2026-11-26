@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # play [--size N] [--pos top|bottom|left|right] [--audio wsl|native] [--provider youtube|spotify|soundcloud] <search>
-# play --tombola [--size N] [--pos ...] [--audio wsl|native]   generative bouncing-ball synth
+# play [--size N] [--pos ...] [--audio wsl|native]   no search words: tombola, the generative synth
+#                                                    (--tombola still works, e.g. with words as well)
 # ← →:seek  ↑ ↓:vol  Space:pause  n:next  p:prev  l:list  s:settings  q:quit
 
 COUNT=10
@@ -65,8 +66,19 @@ MPV_WIN="${PLAY_MPV_WIN:-}"
 # ── Tombola mode (generative synth) ───────────────────────────────────────────
 # Spotted up front: it needs neither yt-dlp nor the Windows temp dir, so the
 # music stack's checks below are skipped. It still opens in the same tmux split.
+# No search words (flags only) also means tombola: plain `play` opens it.
 TOMBOLA=0
-for _a in "$@"; do [ "$_a" = "--tombola" ] && TOMBOLA=1; done
+_words=0; _skip=0
+for _a in "$@"; do
+    if [ "$_skip" = 1 ]; then _skip=0; continue; fi
+    case "$_a" in
+        --tombola) TOMBOLA=1 ;;
+        --size|--pos|--audio|--provider) _skip=1 ;;
+        --*) ;;
+        *) _words=1 ;;
+    esac
+done
+[ "$_words" = 0 ] && TOMBOLA=1
 
 if [ "$PLAY_AUDIO" = "wsl" ] && [ "$TOMBOLA" = 0 ]; then
     WIN_TEMP="${PLAY_WIN_TEMP:-$(detect_win_temp)}"
@@ -120,7 +132,7 @@ while [[ "${1:-}" == --* ]]; do
         --audio)    PLAY_AUDIO="$2";    shift 2 ;;
         --provider) PLAY_PROVIDER="$2"; shift 2 ;;
         --tombola)  shift ;;
-        *) printf "Usage: play [--size N] [--pos top|bottom|left|right] [--audio wsl|native] [--provider youtube|spotify|soundcloud] [--tombola] <query>\n" >&2; exit 1 ;;
+        *) printf "Usage: play [--size N] [--pos top|bottom|left|right] [--audio wsl|native] [--provider youtube|spotify|soundcloud] [--tombola] [<query>]  (no query: tombola)\n" >&2; exit 1 ;;
     esac
 done
 
@@ -180,7 +192,7 @@ fi
 trap '' PIPE
 
 # ── Search with disk cache ────────────────────────────────────────────────────
-QUERY="${*:-ambient sci-fi}"
+QUERY="$*"
 CACHE_DIR="$HOME/.cache/play"
 mkdir -p "$CACHE_DIR"
 declare -a SEARCH_IDS SEARCH_TITLES SEARCH_DURS

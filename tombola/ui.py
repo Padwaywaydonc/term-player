@@ -239,16 +239,29 @@ def knob_layout_fits(state, cols, rows):
 SHORT = {"ATTACK": "ATK", "RELEASE": "REL", "VISUAL": "VIS", "CHANGE": "CHG"}
 HINTS = (("tab", "page"), ("←→", "select"), ("↑↓", "change"), ("3-8 s", "shape"), ("n", "key"),
          ("c", "scale"), ("i", "instr"), ("v", "visual"), ("w", "window"), ("space", "on/off"), ("r", "random"), ("u", "undo"),
-         ("q", "quit"))
+         ("q", "quit"), ("?", "help"), ("o", "tab on/off"), ("P L", "save/load"))
+
+
+RADIO_HINTS = (("tab", "page"), ("←→", "seek"), ("↑↓", "vol"), ("space", "pause"), ("n p", "next/prev"),
+               ("l", "list"), ("s", "source"), ("o", "on/off"), ("?", "help"), ("q", "quit"), ("P L", "save/load"))
 
 
 def _hints(width, page="BALLS"):
     """Key hints that fit in width columns; page/shape/key/scale keys win over the rest.
 
     Digits mean shape on BALLS and chord degree on RINGS."""
-    swap = {"RINGS": ("1-7", "chord"), "CHORDS": ("g x", "new/hold"), "GRAINS": ("f", "freeze")}.get(page)
+    if page == "RADIO":                          # play's player keys
+        keep, used = [], 0
+        for k, label in RADIO_HINTS:
+            if used + len(k) + len(label) + 3 > width - 2:
+                break
+            keep.append(f"{fg(AMBER)}{k}{RESET} {fg(DIM)}{label}{RESET}")
+            used += len(k) + len(label) + 3
+        return "  ".join(keep)
+    swap = {"RINGS": ("1-7", "chord"), "CHORDS": ("g x", "new/hold"), "GRAINS": ("f", "freeze"),
+            "MODS": ("1-4", "mover"), "WARP": ("1-5", "carrier"), "RADIO": ("/ < >", "search/skip")}.get(page)
     hints = HINTS if swap is None else tuple(swap if h[1] == "shape" else h for h in HINTS)
-    order = (0, 3, 4, 5, 6, 12, 10, 11, 8, 1, 2, 9, 7)
+    order = (0, 13, 14, 15, 3, 4, 5, 6, 12, 10, 11, 8, 1, 2, 9, 7)
     keep, used = set(), 0
     for i in order:
         k, label = hints[i]
@@ -259,6 +272,38 @@ def _hints(width, page="BALLS"):
         used += w
     return "  ".join(f"{fg(AMBER)}{k}{RESET} {fg(DIM)}{label}{RESET}"
                      for i, (k, label) in enumerate(hints) if i in keep)
+
+
+def _help_lines(state, width, max_lines=1):
+    """The ? help for the selected setting: the long text, or the short one when narrow,
+    word-wrapped over up to max_lines (the last cut with … if it still won't fit)."""
+    long, short = state["help"]
+    text = long if len(long) <= width * max_lines else short
+    lines, cur = [], ""
+    for word in text.split(" "):
+        if cur and len(cur) + 1 + len(word) > width:
+            lines.append(cur)
+            cur = word
+        else:
+            cur = f"{cur} {word}" if cur else word
+    lines.append(cur)
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        lines[-1] = lines[-1][:max(0, width - 1)] + "…"
+    return [f"{fg(AMBER)}{'?' if i == 0 else ' '}{RESET} {fg(BALL)}{line}{RESET}" for i, line in enumerate(lines)]
+
+
+def _prompt(state):
+    return f"{fg(AMBER)}▸{RESET} {fg(BALL)}{state['prompt']}{RESET}"
+
+
+def _bottom(state, width):
+    """The bottom row: a preset prompt / note, the help line while ? is on, else the key hints."""
+    if state.get("prompt"):
+        return _prompt(state)
+    if state.get("help"):
+        return _help_lines(state, width - 2)[0]
+    return _hints(width, state["page"])
 
 
 def _row(params, sel, width):
@@ -274,7 +319,9 @@ MIN_SCENE_ROWS = 6           # below this (after the knob rows) the frame goes c
 
 def _tabs(state, only_current=False):
     pages = [state["page"]] if only_current else state["pages"]
-    return "  ".join(f"{SELECT} {p} {RESET}" if p == state["page"] else f"{fg(DIM)} {p} {RESET}"
+    off = state.get("off_pages", ())
+    strike = lambda p: f"\x1b[9m{p}\x1b[29m" if p in off else p   # a tab switched off (o) is struck through
+    return "  ".join(f"{SELECT} {strike(p)} {RESET}" if p == state["page"] else f"{fg(DIM)} {strike(p)} {RESET}"
                      for p in pages)
 
 
@@ -348,6 +395,57 @@ def scene(state, cols, rows):
                       state.get("fx"), state.get("bed_level", 0.0))
 
 
+def _clock(t):
+    t = int(t)
+    return f"{t // 60}:{t % 60:02d}"
+
+
+def _cut(text, width):
+    return text if len(text) <= width else text[:max(0, width - 1)] + "…"
+
+
+def radio_panel(view, width, height):
+    """The RADIO page's player, like play's own screen: now playing, a progress bar,
+    and the track list (play's l: ↑↓ moves, typing searches, Enter plays, Esc back)."""
+    if height <= 0 or width < 12:
+        return []
+    icon = {"PLAYING": "▶", "PAUSED": "❚❚", "IDLE": "■"}.get(view["status"], "…")
+    where = f" {view['index'] + 1}/{view['count']}" if view["count"] else ""
+    head_text = view["title"] if view["status"] in ("PLAYING", "PAUSED", "LOADING") and view["title"] else ""
+    status = "" if view["status"] in ("PLAYING", "PAUSED") else view["status"] + "  "
+    if not view["on"] and view["status"] == "IDLE":
+        status = "OFF (o)  "
+    head = f"{fg(AMBER)}{icon}{RESET} {fg(DIM)}{status}{RESET}{fg(BALL)}{_cut(head_text, width - 8 - len(status) - len(where))}{RESET}"
+    head += f"{fg(DIM)}{where}{RESET}"
+    lines = [head]
+    info = f"  {_clock(view['elapsed'])} / {_clock(view['duration'])}  VOL {view['volume']}%  {view['source']}"
+    bar_w = max(4, width - len(info) - 1)
+    frac = min(1.0, view["elapsed"] / view["duration"]) if view["duration"] else 0.0
+    pos = int(frac * (bar_w - 1))
+    lines.append(f"{fg(ORANGE)}{'━' * pos}●{RESET}{fg(DIM)}{'─' * (bar_w - pos - 1)}{info}{RESET}")
+    listing = view["sel"] is not None
+    room = height - len(lines) - 1
+    tracks = view["tracks"]
+    if room > 0 and tracks:
+        focus = view["sel"] if listing else view["index"]
+        start = min(max(0, focus - room // 2), max(0, len(tracks) - room))
+        for i, (title, dur) in enumerate(tracks[start:start + room], start):
+            text = _cut(title, width - 12)
+            row = f"{'▶' if i == view['index'] else ' '} {i + 1:2d}. {text:<{width - 12}} {dur}"
+            if listing and i == view["sel"]:
+                lines.append(f"{SELECT}{row[:width]}{RESET}")
+            else:
+                lines.append(f"{fg(AMBER if i == view['index'] else DIM)}{row[:width]}{RESET}")
+    if height > len(lines):
+        if view["sbuf"]:
+            lines.append(f"  Search: {fg(BALL)}{_cut(view['sbuf'], width - 12)}{RESET}▌")
+        elif listing:
+            lines.append(f"{fg(DIM)}  ↑↓ nav  Enter play  Esc back  type to search{RESET}")
+        elif not tracks:
+            lines.append(f"{fg(DIM)}  l or / then type to search ({view['source'].lower()}){RESET}")
+    return lines[:height]
+
+
 def _chord_row(state, width):
     """A page's one-line banner: the CHORDS loop (current lit, freshly regenerated in amber
     with a dot), the DRUMS bar (tight: one column per step, accents in amber), WARP's
@@ -389,16 +487,24 @@ def _render_compact(state, cols, rows, put):
     if width - title_w >= 28:
         text_put(1, cols - 25, f"{hits}  {_status(state)}")
     lines, at = _flow(side + knobs, sel, width)
+    if state.get("radio"):
+        lines, at = radio_panel(state["radio"], width, max(1, rows - 2)), 0
     row = _chord_row(state, width)
     if row:
         lines, at = [row] + lines, at + 1
-    room = rows - (2 if rows >= 3 else 1)       # header, and the hint line when there is space
+    bottom = [_hints(width, state["page"])]
+    if state.get("prompt"):
+        bottom = [_prompt(state)]
+    elif state.get("help"):                     # help may take two rows from the settings
+        bottom = _help_lines(state, width - 2, 2 if rows >= 5 else 1)
+    room = rows - (1 + len(bottom) if rows >= 3 else 1)   # header, and the bottom line(s) when there is space
     start = min(max(0, at - room // 2), max(0, len(lines) - room))
     for i, line in enumerate(lines[start:start + room]):
         text_put(2 + i, x0, line)
     if rows >= 3:
         err = f" {fg(196)}{state['error']}{RESET}" if state["error"] else ""
-        text_put(rows, x0, _hints(width, state["page"]) + err)
+        for i, line in enumerate(bottom):
+            text_put(rows - len(bottom) + 1 + i, x0, line + (err if i == len(bottom) - 1 else ""))
 
 
 def render(state, cols, rows):
@@ -416,7 +522,7 @@ def render(state, cols, rows):
         _render_compact(state, cols, rows, put)
         return _compose(place, rows)
 
-    put(1, 3, f"\x1b[1m{fg(ORANGE)}TOMBOLA{RESET}   {_tabs(state)}")
+    put(1, 3, _title(state, cols - 16)[0])     # tabs that fit beside HITS
     put(2, 3, f"{fg(DIM)}GENERATIVE SYNTH{RESET}")
     row = _chord_row(state, cols - 4)
     if row:
@@ -426,7 +532,10 @@ def render(state, cols, rows):
     grid = _knob_rows(side + knobs, cols - 4)
     top = 4
     h = rows - top - 4 * len(grid) - 1
-    if not behind:
+    if state.get("radio"):
+        for r, text in enumerate(radio_panel(state["radio"], cols - 4, h)):
+            put(top + r, 3, text)
+    elif not behind:
         for r, text in enumerate(scene(state, cols - 4, h)):
             put(top + r, 3, text)
 
@@ -441,7 +550,7 @@ def render(state, cols, rows):
             x += w + gap
 
     err = f" {fg(196)}{state['error']}{RESET}" if state["error"] else ""
-    put(rows, 3, _hints(cols - 24, state["page"]) + err)
+    put(rows, 3, _bottom(state, cols - 24) + err)
     put(rows, max(3, cols - 18), _status(state))
     return _compose(place, rows)
 

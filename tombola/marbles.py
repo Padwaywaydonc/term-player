@@ -80,6 +80,12 @@ class ChordSequencer:
     def is_fresh(self, slot):
         return self.steps - self.fresh.get(slot, -FRESH_STEPS - 1) <= FRESH_STEPS
 
+    def reseed(self, seed):
+        """A new loop drawn from seed: the same seed always gives the same chords."""
+        self.rng = random.Random(seed)
+        self.steps, self.current = 0, 0
+        self.regenerate()
+
 
 # Chords from colourful to stable: the absolute ladder the native loop maps values onto.
 LADDER = (6, 2, 1, 5, 3, 4, 0)           # VII, III, II, VI, IV, V, I
@@ -128,6 +134,11 @@ class LoopSequencer:
         self.steps, self.current, self.pos = 0, 0, 0
         self.loop = [0] * self.length
         self.fresh = {i: 0 for i in range(self.length)}
+
+    def reseed(self, seed):
+        """A new loop drawn from seed: the same seed always gives the same chords."""
+        self.seed = seed - 1                     # regenerate() moves on to the next seed
+        self.regenerate()
 
     def set_length(self, length):
         self.loop = (self.loop + [0] * length)[:length]

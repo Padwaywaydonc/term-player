@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# E2E test for `play --tombola`: the generative synth must start without the
+# E2E test for plain `play` (tombola): the generative synth must start without the
 # music stack (no yt-dlp on PATH), draw the polygon + parameter panel, stream
 # non-silent PCM into the audio sink, react to keys, and on quit restore the
 # terminal, close the sink, and persist its settings.
@@ -44,7 +44,7 @@ done
 
 tmux new-session -d -s "$SESS" -x 110 -y 34 \
     "env -i HOME=$WORK/home TERM=xterm-256color PATH=$WORK/bin PLAY_MPV_WIN=$WORK/bin/mpv.exe \
-     bash -c '$PLAY_BIN --tombola --audio wsl; echo EXIT=\$? > $WORK/exit; stty -a > $WORK/stty; sleep 30'"
+     bash -c '$PLAY_BIN --audio wsl; echo EXIT=\$? > $WORK/exit; stty -a > $WORK/stty; sleep 30'"
 
 FAIL=0
 fail() { echo "FAIL: $*"; FAIL=1; }
@@ -67,7 +67,7 @@ grep -q 'MAJOR' <<<"$SCREEN2" || fail "hotkey c did not advance scale MINOR -> M
 tmux send-keys -t "$SESS" Tab Up
 sleep 0.5
 SCREEN3=$(tmux capture-pane -p -t "$SESS")
-for label in MOONS SPEED TILT PAD FLOOR CHORD RATIO INSTR; do
+for label in MOONS ORBIT TILT PAD FLOOR CHORD RATIO INSTR SYNC BPM CLK; do
     grep -q "$label" <<<"$SCREEN3" || fail "RINGS page is missing label $label"
 done
 
@@ -92,7 +92,25 @@ check_page() {   # $1 page name, rest: labels it must show
 check_page GRAINS DENSITY TEXTURE
 check_page DRUMS BPM "MAP X" KICK SNARE HATS STOP
 check_page WARP CARRIER ALGO MIX XFADE VOCODER
-check_page MODS RATE SHAPE SHIFT "TO 1" DEPTH
+check_page MODS CYCLE SHAPE SHIFT "TO 1" DEPTH SYNC
+
+# ? explains the selected setting; 3 jumps to mover 3.
+tmux send-keys -t "$SESS" '?' 3
+sleep 0.5
+SCREEN5=$(tmux capture-pane -p -t "$SESS")
+grep -q "Setting mover 3 moves" <<<"$SCREEN5" || fail "? help / mover digit did not show"
+tmux send-keys -t "$SESS" '?'
+
+# RADIO (last tab): no yt-dlp/ffmpeg in this sandbox, so it says what it needs.
+check_page RADIO VOL YOUTUBE NEEDS seek
+# o switches a tab: DRUMS on, then the bar shows PLAY.
+tmux send-keys -t "$SESS" Tab Tab Tab Tab Tab o
+sleep 0.5
+grep -q "PLAY" <<<"$(tmux capture-pane -p -t "$SESS")" || fail "o did not switch DRUMS on"
+# P then 4 saves a preset; the bottom line confirms it.
+tmux send-keys -t "$SESS" P 4
+sleep 0.5
+grep -q "SAVED PRESET 4" <<<"$(tmux capture-pane -p -t "$SESS")" || fail "P 4 did not confirm the preset"
 sleep 3
 tmux send-keys -t "$SESS" q
 for _ in $(seq 1 20); do [ -f "$WORK/exit" ] && break; sleep 0.25; done
@@ -105,8 +123,8 @@ grep -qx -- '--demuxer-rawaudio-format=s16le' "$WORK/sink.args" 2>/dev/null || f
 BYTES=$(stat -c %s "$WORK/sink.pcm" 2>/dev/null || echo 0)
 RATE=$(sed -n 's/^--demuxer-rawaudio-rate=//p' "$WORK/sink.args"); CH=$(sed -n 's/^--demuxer-rawaudio-channels=//p' "$WORK/sink.args")
 SECS=$(( BYTES / (${RATE:-22050} * ${CH:-1} * 2) ))
-# ~6-7 s of run time: paced output must be near real time, not a burst (any engine format).
-[ "$SECS" -ge 4 ] && [ "$SECS" -le 10 ] || fail "unexpected PCM length: $SECS s ($BYTES bytes at ${RATE}Hz x$CH)"
+# ~10-12 s of run time: paced output must be near real time, not a burst (any engine format).
+[ "$SECS" -ge 4 ] && [ "$SECS" -le 16 ] || fail "unexpected PCM length: $SECS s ($BYTES bytes at ${RATE}Hz x$CH)"
 PEAK=$(python3 -c "
 import sys
 from array import array
@@ -117,6 +135,8 @@ print(max(map(abs, array('h', raw[:len(raw) // 2 * 2])), default=0))" "$WORK/sin
 grep -q '"grav": 40' "$WORK/home/.config/play-tombola.json" 2>/dev/null || fail "GRAV change not persisted"
 grep -q '"shape": "TRI"' "$WORK/home/.config/play-tombola.json" 2>/dev/null || fail "shape hotkey not persisted"
 grep -q '"rings": 4' "$WORK/home/.config/play-tombola.json" 2>/dev/null || fail "RINGS change not persisted"
+grep -q '"loop_seed": [0-9]' "$WORK/home/.config/play-tombola.json" 2>/dev/null || fail "chord loop seed not persisted"
+grep -q '"loop_seed": [0-9]' "$WORK/home/.config/play-tombola-presets/slot-4.json" 2>/dev/null || fail "preset 4 not saved with its seed"
 
 [ $FAIL -eq 0 ] && echo "PASS: tombola e2e (pcm=${SECS}s at ${RATE}Hz x$CH, peak=$PEAK)"
 exit $FAIL

@@ -575,10 +575,29 @@ class ChordClockTest(unittest.TestCase):
             self.assertAlmostEqual(r.moon_level(0, r.top_angle()), 1.0, places=6)
 
     def test_moon_clock_ticks_once_per_outer_moon_pass(self):
-        e = self.engine(clock="MOON", rings=2, moons=1, speed=100, ratio="SYNC")
+        e = self.engine(clock="MOON", rings=2, moons=1, speed=100, ratio="SYNC", rsync="OFF")
         omega = e.rings.omega(1)                                   # outer ring
         expected = 30 * omega / TAU
         self.assertLessEqual(abs(self.run_for(e, 30) - expected), 1.0)
+
+    def test_synced_moons_and_bars_clock_land_on_the_bar(self):
+        e = self.engine(clock="MOON", rings=2, moons=1, ratio="SYNC", rsync="ON", rbars=1, bpm=120)
+        self.run_for(e, 4)                                         # the rings settle onto the grid
+        self.assertEqual(self.run_for(e, 20), 10)                 # 1-bar orbit at 120 BPM: every 2 s
+        e = self.engine(clock="BARS", cbars=2, bpm=120)
+        self.assertEqual(self.run_for(e, 20.01), 5)               # every 2 bars = 4 s
+        e = self.engine(clock="BARS", cbars=2, bpm=120, clk_chords="x2")
+        self.assertEqual(self.run_for(e, 20.01), 10)              # its clock twice the master
+
+    def test_synced_ring_never_jumps_when_the_tempo_changes(self):
+        e = self.engine(rsync="ON", rbars=1, bpm=120)
+        for _ in range(300):
+            e.step(1 / 120)
+        before = list(e.rings.phase)
+        e.params["bpm"].index = e.params["bpm"].values.index(60)
+        e.apply()
+        e.step(1 / 120)
+        self.assertLess(max(abs(a - b) for a, b in zip(e.rings.phase, before)), 0.2)
 
     def test_time_clock_with_jitter(self):
         e = self.engine(clock="TIME", change=2, jitter=0)
@@ -710,19 +729,31 @@ class NativeCoreTest(unittest.TestCase):
         self.assertLess(self.rms(wet[200000:]), 50)            # source gone, not frozen: fades
         self.assertGreater(self.rms(frozen[200000:]), 300)      # frozen: keeps granulating
 
-    def test_feedback_at_maximum_dies_away(self):
-        m = self.mixer(level=1.0, density=0.8, size=0.4, feedback=1.0)
-        m.grain_source, m.bed = "RINGS", 0.5
-        left = self.run_for(m, 20, lambda mm, b: mm.set_rings(
-            [(57, 1.0 if b * native.BLOCK / self.SR < 5 else 0.0)]))[0]
-        self.assertLess(self.rms(left[-96000:]), 200)
+    def test_feedback_top_sustains_a_bed_that_can_be_stopped(self):
+        def run(feedback, lower_at=None):
+            m = self.mixer(level=1.0, density=0.8, size=0.4, feedback=feedback)
+            m.grain_source, m.bed = "RINGS", 0.5
+
+            def each(mm, b):
+                t = b * native.BLOCK / self.SR
+                mm.set_rings([(57, 1.0 if t < 5 else 0.0)])
+                if lower_at is not None and t >= lower_at:
+                    mm.cloud.feedback = 0.3
+            return self.run_for(m, 20, each)[0]
+        top = run(1.0)
+        self.assertGreater(self.rms(top[-96000:]), 1000)       # source gone 15 s ago: the bed goes on
+        self.assertLess(max(map(abs, top)), 32000)              # ... without clipping
+        self.assertLess(self.rms(run(0.5)[-96000:]), 200)       # mid FEEDBACK still fades
+        self.assertLess(self.rms(run(1.0, lower_at=10)[-96000:]), 200)   # turning it down ends the bed
 
     def test_all_grain_modes_play(self):
-        for mode in native.GRAIN_MODES:
-            m = self.mixer(level=1.0, density=0.7, size=0.2, mode=mode)
+        def run(mode, level):
+            m = self.mixer(level=level, density=0.7, size=0.2, mode=mode)
             m.grain_source, m.bed = "RINGS", 0.4
-            left = self.run_for(m, 2, lambda mm, b: mm.set_rings([(57, 1.0)]))[0]
-            self.assertGreater(self.rms(left[48000:]), 100, mode)
+            return self.run_for(m, 2, lambda mm, b: mm.set_rings([(57, 1.0)]))[0][48000:]
+        for mode in native.GRAIN_MODES:              # the grains alone: with them minus without
+            wet = [a - b for a, b in zip(run(mode, 1.0), run(mode, 0.0))]
+            self.assertGreater(self.rms(wet), 300, mode)
 
     def test_renders_far_faster_than_real_time(self):
         m = self.mixer(level=1.0, density=0.8, size=0.4)
@@ -752,6 +783,49 @@ class NativeCoreTest(unittest.TestCase):
         self.assertGreater(loud, 3 * quiet)                      # quieter ...
         self.assertGreater(bright_loud, 1.5 * bright_quiet)      # ... and darker, like a low-pass gate
 
+    def test_tab_clock_ratios_and_quantized_hits(self):
+        def steps(ratio):
+            m = self.mixer()
+            m.clock.update(bpm=120.0, drum_ratio=ratio)
+            m.drums["play"] = 1
+            for _ in range(100):                                          # 1 s = 2 beats
+                m.render()
+            return m.drum_step()
+        self.assertEqual(steps(1.0), 16)                                 # 8 steps a beat
+        self.assertEqual(steps(2.0), 0)                                  # twice as fast: 32 = a full bar
+        self.assertEqual(steps(0.5), 8)
+        m = self.mixer()                                                 # 1/4 grid at 60 BPM: hits wait for the beat
+        m.synth["engine"] = 8
+        m.clock.update(bpm=60.0, quant=1)
+        for _ in range(30):
+            m.render()
+        m.synth_hit(69, 1.0)
+        out = [self.rms(array("h", m.render())) for _ in range(100)]
+        first = next(i for i, v in enumerate(out) if v > 50)
+        self.assertGreaterEqual(first, 60)                               # ... held until 1.0 s, not played at 0.3 s
+        self.assertLessEqual(first, 72)
+
+    def test_tabs_off_fade_out_their_sound(self):
+        def level(**buses):
+            m = self.mixer()
+            m.drums.update(play=1, density=(0.6, 0.5, 0.7))
+            m.buses.update(buses)
+            return self.rms(self.run_for(m, 1.0)[0][24000:])
+        self.assertGreater(level(), 300)
+        self.assertEqual(level(drums=0.0), 0)
+
+    def test_radio_plays_what_is_pushed(self):
+        m = self.mixer()
+        tone = array("h", [int(8000 * math.sin(2 * math.pi * 440 * i / 48000)) for i in range(48000) for _ in (0, 1)])
+        self.assertEqual(m.radio_push(tone.tobytes()[:4 * 24000]), 4 * 24000)
+        self.assertAlmostEqual(m.radio_queued(), 0.5, places=2)
+        left = self.run_for(m, 0.4)[0]
+        self.assertGreater(self.mag(left, 440.0, 0, 9600), 10 * self.mag(left, 466.2, 0, 9600))
+        m.radio_level = 0.0
+        self.assertEqual(self.rms(self.run_for(m, 0.05)[0]), 0)          # VOL 0: silent
+        m.radio_clear()
+        self.assertEqual(m.radio_queued(), 0)
+
     def test_drums_play_only_when_on_and_follow_density(self):
         def level(**drums):
             m = self.mixer()
@@ -760,6 +834,17 @@ class NativeCoreTest(unittest.TestCase):
         self.assertEqual(level(play=0), 0)
         self.assertGreater(level(play=1, density=(0.6, 0.5, 0.7)), 300)
         self.assertEqual(level(play=1, density=(0.0, 0.0, 0.0)), 0)       # density 0: that part never plays
+
+    def test_drum_tempo_spans_10_to_200_bpm(self):
+        bpm = next(p for p in app.make_params() if p.key == "bpm")
+        self.assertEqual((bpm.values[0], bpm.values[-1], bpm.value), (10, 200, 112))
+        for tempo in (10, 200):
+            m = self.mixer()
+            m.drums["play"] = 1
+            m.clock["bpm"] = float(tempo)
+            for _ in range(100):                                       # 1 s
+                m.render()
+            self.assertEqual(m.drum_step(), (tempo * 8 // 60) % 32, tempo)   # 8 steps per beat
 
     def test_drum_map_moves_from_straight_to_busy(self):
         m = self.mixer()
@@ -811,6 +896,7 @@ class NativeCoreTest(unittest.TestCase):
         e.params["mto1"].index = e.params["mto1"].values.index("TILT")
         e.params["mdep1"].index = e.params["mdep1"].values.index(100)
         e.params["mrate"].index = e.params["mrate"].values.index(5)
+        e.params["msync"].index = 0                                   # free-running at RATE
         e.apply()
         tilts = set()
         for _ in range(60):
@@ -1124,10 +1210,10 @@ class AppTest(unittest.TestCase):
         self.assertEqual(menu.page, "CHORDS")
         app.handle_key("page", e, menu)
         self.assertEqual(menu.page, "GRAINS")
-        for page in ("DRUMS", "WARP", "MODS"):
+        for page in ("DRUMS", "WARP", "MODS", "RADIO"):
             app.handle_key("page", e, menu)
             self.assertEqual(menu.page, page)
-        app.handle_key("page", e, menu)                     # seven pages, then back round
+        app.handle_key("page", e, menu)                     # eight pages, then back round
         self.assertIs(menu.selected(), balls_sel)
         self.assertEqual(app.parse_keys(b"\t"), ["page"])
 
@@ -1260,6 +1346,46 @@ class AppTest(unittest.TestCase):
             e.undo()                                             # history entries migrate too
             self.assertEqual((e.v("instr"), e.v("chord")), ("RESONATOR", "RANDOM"))
 
+    def test_every_setting_has_plain_help(self):
+        import explain
+        for p in app.make_params():
+            self.assertIn(p.key, explain.HELP, p.key)
+            for i in range(len(p.values)):
+                p.index = i
+                long, short = explain.explain(p)
+                self.assertLessEqual(len(short), 72, (p.key, p.value, short))
+        self.assertLessEqual(set(explain.VALUES), {p.key for p in app.make_params()})
+
+    def test_question_mark_shows_help_for_the_selected_setting(self):
+        e = app.Engine(app.make_params())
+        menu = app.Menu(list(e.params.values()))
+        self.assertEqual(app.parse_keys(b"?"), ["help"])
+        self.assertIsNone(app.ui_state(e, menu)["help"])
+        app.handle_key("help", e, menu)
+        strip = lambda t: re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", t)
+        for cols, rows in ((120, 40), (60, 6)):
+            frame = strip(ui.render(app.ui_state(e, menu), cols, rows))
+            self.assertIn("BALLS:", frame)                               # first knob: BALLS
+            self.assertIn("How many balls", frame)
+        app.handle_key("right", e, menu)
+        self.assertIn("Gravity", app.ui_state(e, menu)["help"][0])       # follows the cursor
+        app.handle_key("help", e, menu)
+        self.assertIsNone(app.ui_state(e, menu)["help"])
+
+    def test_digits_pick_mods_movers_and_warp_carriers(self):
+        e = app.Engine(app.make_params())
+        menu = app.Menu(list(e.params.values()))
+        menu.page = "MODS"
+        for n in (3, 1, 4):
+            app.handle_key(("digit", n), e, menu)
+            self.assertEqual(menu.selected().key, f"mto{n}")
+        app.handle_key(("digit", 7), e, menu)                            # no mover 7: stays put
+        self.assertEqual(menu.selected().key, "mto4")
+        menu.page = "WARP"
+        for n, carrier in ((3, "SINE"), (2, "DRUMS"), (5, "SAW")):
+            app.handle_key(("digit", n), e, menu)
+            self.assertEqual(e.v("wcar"), carrier)
+
     def test_arpeggiator_port_walks_like_the_original(self):
         from arp import Arpeggiator
         def walk(mode, n=9, notes=3, range_=2):
@@ -1294,13 +1420,172 @@ class AppTest(unittest.TestCase):
         e = app.Engine(app.make_params())
         menu = app.Menu(list(e.params.values()))
         e.params["mto1"].index = e.params["mto1"].values.index("TILT")
-        e.params["dplay"].index = 1
+        e.params["on_drums"].index = 1
         e.apply()
         self.assertEqual(e.tilt_lanes, [])
         for page in ("DRUMS", "MODS"):
             menu.page = page
             self.assertIn("48K ONLY", app.ui_state(e, menu)["banner"][0])
         e.step(0.1)
+
+    def test_radio_searches_downloads_decodes_and_moves_on(self):
+        import io
+        import radio as radio_mod
+        calls = []
+
+        class Proc:
+            def __init__(self, args, **kw):
+                calls.append(args)
+                if args[0] == "yt-dlp" and "--flat-playlist" in args:
+                    out = b"id1|First song|3:00\nid2|Second song|2:00\n"
+                elif args[0] == "yt-dlp":
+                    path = os.path.join(args[args.index("-o") + 1].rsplit("/", 1)[0], args[-1][-3:] + ".m4a")
+                    open(path, "wb").close()
+                    out = path.encode() + b"\n"
+                else:
+                    out = b"\x01\x00\x02\x00" * 4800                       # 0.1 s of PCM
+                self.stdout = io.BytesIO(out)
+            def communicate(self):
+                return self.stdout.read(), b""
+            def poll(self):
+                return 0
+            def kill(self):
+                pass
+
+        class Mixer:
+            def __init__(self):
+                self.got = b""
+            def radio_push(self, pcm):
+                self.got += pcm
+                return len(pcm)
+            def radio_clear(self):
+                pass
+            def radio_queued(self):
+                return 0.0
+
+        mixer = Mixer()
+        r = radio_mod.Radio(mixer, run=Proc, which=lambda tool: "/bin/" + tool)
+        self.assertEqual(r.missing(), "")
+        r.search("lofi", "YOUTUBE")
+        deadline = time.time() + 5
+        while len([c for c in calls if c[0] == "ffmpeg"]) < 2 and time.time() < deadline:
+            time.sleep(0.01)                                             # first track ends: on to the second
+        r.stop()
+        self.assertEqual(calls[0][-1], "ytsearch10:lofi")
+        self.assertIn("https://www.youtube.com/watch?v=id1", calls[1])
+        self.assertIn("-ar", calls[2])
+        self.assertGreaterEqual(len(mixer.got), 4 * 4800)
+        self.assertEqual([t for _, t, _ in r.results], ["First song", "Second song"])
+        self.assertEqual(r.status, "IDLE")
+        r.close()
+        self.assertIn("NEEDS", radio_mod.Radio(mixer, which=lambda tool: None).missing())
+        self.assertEqual(radio_mod.Radio(object()).missing(), "48K ONLY")
+
+    def radio_engine(self):
+        """An engine on the RADIO page whose radio records what it's asked to do."""
+        e = app.Engine(app.make_params())
+        menu = app.Menu(list(e.params.values()))
+        menu.page = "RADIO"
+        calls = []
+        r = e.radio
+        r.results = [("a", "One", "3:00"), ("b", "Two", "2:00"), ("c", "Three", "1:00")]
+        for name in ("seek", "pause", "skip", "play"):
+            setattr(r, name, lambda *a, name=name: calls.append((name, *a)))
+        e.search_radio = lambda q: calls.append(("search", q))
+        return e, menu, calls
+
+    def test_radio_page_has_plays_player_keys(self):
+        e, menu, calls = self.radio_engine()
+        vol = e.v("radvol")
+        app.handle_radio_input(b"\x1b[C\x1b[D\x1b[A\x1b[A\x1b[B np", e, menu)
+        self.assertEqual(calls, [("seek", 10), ("seek", -10), ("play",), ("skip", 1), ("skip", -1)])   # space: start
+        self.assertEqual(e.v("radvol"), vol + 5)                         # up up down: +5
+        self.assertTrue(e.tab_on("RADIO"))                                # skipping switched it on
+        e.radio.status = "PLAYING"
+        app.handle_radio_input(b" ", e, menu)
+        self.assertEqual(calls[-1], ("pause",))
+        source = e.v("rsrc")
+        app.handle_radio_input(b"s", e, menu)                            # s: next source
+        self.assertNotEqual(e.v("rsrc"), source)
+        app.handle_radio_input(b"\t", e, menu)                           # tab still changes page
+        self.assertEqual(menu.page, "BALLS")
+
+    def test_radio_list_navigates_searches_and_plays(self):
+        e, menu, calls = self.radio_engine()
+        e.radio.index = 1
+        app.handle_radio_input(b"l", e, menu)
+        self.assertEqual(menu.radio_list, {"sel": 1, "sbuf": ""})         # opens on the playing track
+        app.handle_radio_input(b"\x1b[B\x1b[B\x1b[A", e, menu)
+        self.assertEqual(menu.radio_list["sel"], 1)                        # down, down (stops at 2), up
+        app.handle_radio_input(b"\r", e, menu)
+        self.assertEqual(calls[-1], ("play", 1))
+        self.assertIsNone(menu.radio_list)                                 # Enter plays and closes
+        app.handle_radio_input(b"/queenx\x7f\r", e, menu)                  # q types a q, backspace edits
+        self.assertEqual(calls[-1], ("search", "queen"))
+        self.assertEqual(menu.radio_list, {"sel": 0, "sbuf": ""})          # list stays open for the results
+        app.handle_radio_input(b"\x1b", e, menu)
+        self.assertIsNone(menu.radio_list)
+        view = app.ui_state(e, menu)["radio"]
+        self.assertEqual(view["tracks"][2], ("Three", "1:00"))
+        frame = ui.render(app.ui_state(e, menu), 120, 40)
+        self.assertIn("Three", frame)
+        self.assertIn("48K ONLY", frame)                                  # the Python engine has no radio
+
+    def test_radio_seek_and_pause_on_a_track(self):
+        import radio as radio_mod
+
+        class Mixer:
+            radio_paused = False
+            def radio_push(self, pcm):
+                return len(pcm)
+            def radio_clear(self):
+                pass
+            def radio_queued(self):
+                return 0.0
+        started = []
+        r = radio_mod.Radio(Mixer(), which=lambda tool: "/bin/" + tool)
+        r._decode = lambda gen, path, start, index: started.append(start)
+        r.results, r.path, r.status, r.played = [("a", "One", "3:00")], "/x.m4a", "PLAYING", 192000 * 60
+        r.seek(10)
+        time.sleep(0.05)
+        self.assertAlmostEqual(started[-1], 70.0)
+        r.status, r.start, r.played = "PLAYING", 170.0, 0
+        r.seek(30)
+        time.sleep(0.05)
+        self.assertAlmostEqual(started[-1], 179.0)                         # never past the end
+        r.pause()
+        self.assertEqual(r.status, "PAUSED")
+        self.assertTrue(r.mixer.radio_paused)
+        r.pause()
+        self.assertFalse(r.mixer.radio_paused)
+        self.assertEqual(radio_mod.seconds("1:02:03"), 3723)
+        self.assertIn("KEYS", radio_mod.Radio(Mixer(), which=lambda t: t, keys=lambda: ("", "")).missing("SPOTIFY"))
+
+    def test_o_switches_the_tab_and_undo_leaves_it(self):
+        e = app.Engine(app.make_params())
+        menu = app.Menu(list(e.params.values()))
+        self.assertEqual(app.parse_keys(b"o"), ["tab"])
+        self.assertTrue(e.tab_on("BALLS"))
+        app.handle_key("tab", e, menu)
+        self.assertFalse(e.tab_on("BALLS"))
+        self.assertIn("BALLS", app.ui_state(e, menu)["off_pages"])
+        self.assertIn("\x1b[9mBALLS", ui.render(app.ui_state(e, menu), 120, 40))   # struck through
+        hits = e.hits
+        for _ in range(600):
+            e.step(1 / 120)
+        self.assertEqual(e.hits, hits)                                  # balls bounce, silently
+        e.randomize("BALLS", random.Random(1))
+        app.handle_key("tab", e, menu)                                   # back on, then undo the roll
+        e.undo()
+        self.assertTrue(e.tab_on("BALLS"))
+
+    def test_old_drum_settings_migrate_to_the_clock_and_switch(self):
+        ps = app.make_params()
+        app.apply_snapshot(ps, {"dbpm": 140, "dplay": "ON"})
+        values = {p.key: p.value for p in ps}
+        self.assertEqual((values["bpm"], values["on_drums"]), (140, "ON"))
+        app.apply_snapshot(ps, {"dbpm": 60, "bpm": 100})                 # the new key wins
+        self.assertEqual(next(p.value for p in ps if p.key == "bpm"), 100)
 
     def test_native_only_voices_have_python_stand_ins(self):
         e = app.Engine(app.make_params())                      # Python engine (forced in this module)
@@ -1329,11 +1614,11 @@ class AppTest(unittest.TestCase):
         menu = app.Menu(ps)
         visual = e.params["visual"]
         octants = set(ui.OCTANT[1:]) - {"█"}
-        page_labels = {"BALLS": ("GRAV", "BOUNCE", "SHAPE"), "RINGS": ("RINGS", "MOONS", "SPEED", "PAD", "FLOOR"),
+        page_labels = {"BALLS": ("GRAV", "BOUNCE", "SHAPE"), "RINGS": ("RINGS", "MOONS", "ORBIT", "PAD", "FLOOR", "BPM", "CLK"),
                        "GRAINS": ("DENSITY", "SIZE", "POSITION", "TEXTURE", "FEEDBACK", "SOURCE"),
                        "CHORDS": ("CLOCK", "CHANCE", "LENGTH", "DEJA VU", "BIAS"),
                        "DRUMS": ("BPM", "MAP X", "CHAOS", "KICK", "HATS"), "WARP": ("CARRIER", "ALGO", "MIX"),
-                       "MODS": ("RATE", "SHAPE", "SHIFT", "TO 1", "DEPTH")}
+                       "MODS": ("CYCLE", "SHAPE", "SHIFT", "TO 1", "DEPTH", "SYNC"), "RADIO": ("VOL", "YOUTUBE")}
         for mode, is_glyph in (("PIXEL", lambda c: c in "▀▄█"),
                                ("BEHIND", lambda c: c in "▀▄█"),
                                ("BLOCK", lambda c: c in octants),
@@ -1343,8 +1628,9 @@ class AppTest(unittest.TestCase):
                 menu.page = page
                 for cols, rows in ((120, 40), (60, 16)):
                     frame = ui.render(app.ui_state(e, menu), cols, rows)
-                    self.assertTrue(any(map(is_glyph, frame)), mode)
-                    for label in ("SCALE", page, *page_labels[page]):
+                    if not (page == "RADIO" and mode != "BEHIND"):   # RADIO: the player, not the scene
+                        self.assertTrue(any(map(is_glyph, frame)), (mode, page, cols))
+                    for label in (("SCALE",) if page != "RADIO" else ()) + (page, *page_labels[page]):
                         self.assertIn(label, frame, (page, cols))
                     if cols >= 100:                            # narrow strips drop the title, then other tabs
                         for label in ("HITS", "TOMBOLA", *menu.pages):
@@ -1387,7 +1673,7 @@ class AppTest(unittest.TestCase):
         self.assertGreater(len(seen), 15)
 
     def test_random_only_touches_the_current_page(self):
-        for page in app.PAGES:
+        for page in (p for p in app.PAGES if app.random_keys(p)):    # RADIO has nothing to roll
             e = app.Engine(app.make_params())
             own = set(app.random_keys(page))
             self.assertTrue(own)
@@ -1492,6 +1778,115 @@ class AppTest(unittest.TestCase):
         shapes = next(p for p in app.make_params() if p.key == "shape").values
         self.assertEqual(shapes[0], "TRI")
         self.assertEqual(shapes[5], "OCT")
+
+
+class PresetTest(unittest.TestCase):
+    def engine(self, mixer=None):
+        e = app.Engine(app.make_params(), mixer=mixer)
+        e.preset_dir = tempfile.mkdtemp()
+        return e
+
+    def press(self, e, m, *keys):
+        for k in keys:
+            app.handle_key(k, e, m)
+
+    def test_save_then_load_brings_settings_and_loop_back(self):
+        e = self.engine()
+        m = app.Menu(list(e.params.values()))
+        e.params["scale"].nudge(2)
+        e.params["bpm"].nudge(5)
+        scale, bpm, seed, loop = e.v("scale"), e.v("bpm"), e.loop_seed, list(e.sequencer.loop)
+        self.press(e, m, "preset_save", ("digit", 3))
+        self.assertEqual(app.preset_prompt(e, m), "SAVED PRESET 3")
+        e.params["scale"].nudge(1)
+        e.params["bpm"].nudge(-3)
+        e.regenerate()
+        self.assertNotEqual(e.loop_seed, seed)
+        self.press(e, m, "preset_load", ("digit", 3))
+        self.assertEqual((e.v("scale"), e.v("bpm"), e.loop_seed), (scale, bpm, seed))
+        self.assertEqual(e.sequencer.loop, loop)
+
+    def test_load_is_undoable_seed_included(self):
+        e = self.engine()
+        m = app.Menu(list(e.params.values()))
+        self.press(e, m, "preset_save", ("digit", 1))
+        e.params["key"].nudge(1)
+        e.regenerate()
+        key, seed = e.v("key"), e.loop_seed
+        self.press(e, m, "preset_load", ("digit", 1))
+        self.assertNotEqual(e.v("key"), key)
+        self.assertTrue(e.undo())
+        self.assertEqual((e.v("key"), e.loop_seed), (key, seed))
+
+    def test_other_key_cancels_and_empty_slot_says_so(self):
+        e = self.engine()
+        m = app.Menu(list(e.params.values()))
+        page = m.page
+        self.press(e, m, "preset_save")
+        self.assertIn("SAVE PRESET", app.preset_prompt(e, m))
+        self.press(e, m, "page")                   # cancels, doesn't switch page
+        self.assertEqual((m.page, m.pending, app.preset_prompt(e, m)), (page, None, "CANCELLED"))
+        self.assertEqual(os.listdir(e.preset_dir), [])
+        self.press(e, m, "preset_load")
+        self.assertIn("NO PRESETS", app.preset_prompt(e, m))
+        self.press(e, m, ("digit", 7))
+        self.assertEqual(app.preset_prompt(e, m), "PRESET 7 IS EMPTY")
+        self.assertEqual(e.history, [])
+
+    def test_keys_reach_presets_on_every_page(self):
+        self.assertEqual(app.parse_keys(b"P4L4"), ["preset_save", ("digit", 4), "preset_load", ("digit", 4)])
+        e = self.engine()
+        m = app.Menu(list(e.params.values()))
+        m.page = "RADIO"
+        app.handle_radio_input(b"P2", e, m)        # P, then 2: not RADIO's player keys
+        self.assertEqual(app.presets.used(e.preset_dir), [2])
+        app.handle_radio_input(b"Ln", e, m)        # n cancels the load, doesn't skip a track
+        self.assertIsNone(m.pending)
+
+    def test_window_is_not_part_of_a_preset(self):
+        e = self.engine()
+        e.save_preset(5)
+        with open(app.presets.path(5, e.preset_dir)) as f:
+            saved = json.load(f)
+        self.assertNotIn("window", saved)
+        self.assertEqual(saved["loop_seed"], e.loop_seed)
+
+    def test_bad_preset_files_are_ignored(self):
+        d = tempfile.mkdtemp()
+        with open(app.presets.path(1, d), "w") as f:
+            f.write("{broken")
+        with open(app.presets.path(2, d), "w") as f:
+            json.dump({"scale": "NOPE", "loop_seed": "x", "radio_query": 5}, f)
+        self.assertIsNone(app.presets.load(1, d))
+        self.assertEqual(app.presets.load(2, d), ({"scale": "NOPE"}, None, ""))
+
+    def test_same_seed_same_chords(self):
+        a, b = ChordSequencer(), ChordSequencer()
+        a.reseed(42)
+        b.reseed(42)
+        for _ in range(40):
+            self.assertEqual(a.next(), b.next())
+        b.reseed(43)
+        a.reseed(42)
+        self.assertNotEqual([a.next() for _ in range(16)], [b.next() for _ in range(16)])
+
+    def test_seed_survives_a_restart(self):
+        path = os.path.join(tempfile.mkdtemp(), "t.json")
+        e = self.engine()
+        app.save_params(e.params.values(), path, loop_seed=e.loop_seed)
+        self.assertEqual(app.load_seed(path), e.loop_seed)
+        app.save_params(e.params.values(), path)
+        self.assertIsNone(app.load_seed(path))
+
+    @unittest.skipUnless(LIB, "native core not built (cd native && make)")
+    def test_same_seed_same_chords_native(self):
+        runs = []
+        for _ in range(2):
+            e = self.engine(native.NativeMixer(LIB))
+            e.reseed_loop(1234)
+            runs.append([e.sequencer.next() for _ in range(24)])
+            e.close()
+        self.assertEqual(runs[0], runs[1])
 
 
 if __name__ == "__main__":

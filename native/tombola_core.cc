@@ -45,7 +45,10 @@ const int kTable = 2048;
 const int kMaxVoices = 24;
 const float kResonatorGain = 4.0f;     // the resonator's output sits well below full scale
 const float kCloudsDrive = 3.0f;       // like the module's input gain: feed the buffer properly
-const float kFeedbackMax = 0.42f;      // measured: from ~0.49 dense clouds sustain forever
+const float kFeedbackMax = 0.7f;       // from ~0.49 dense clouds sustain forever: the top of FEEDBACK is an endless bed
+const float kCloudsOut = 4.0f;         // wet makeup: grains sit with (or over) the dry sound, as on the module
+// Soft ceiling for the wet grains (unity for small signals, never past +-1.5): loud, never harsh.
+inline float wet_limit(float x) { return 1.5f * std::tanh(x / 1.5f); }
 
 struct Params {                        // mirrors TcParams in tombola/native.py
   float volume, reverb, ring_level;
@@ -74,7 +77,22 @@ struct Params {                        // mirrors TcParams in tombola/native.py
   float mod_rate, mod_shape, mod_slope, mod_smooth, mod_shift;
   int mod_target[4];
   float mod_depth[4];
+  // Master clock: bpm, and each tab's ratio to it (x4 = 4, /2 = 0.5). Hits wait for the next
+  // 1/quant beat of the balls' clock (quant 0 = play at once). mod_cycle: beats per MODS cycle
+  // when locked (0 = free-running at mod_rate).
+  float bpm, ball_ratio, drum_ratio, mod_ratio;
+  int quant;
+  float mod_cycle;
+  // Tab on/off, each faded (no clicks): balls, rings, grains, drums, warp, radio.
+  float bus_on[6];
+  float radio_level;
+  int radio_paused;                    // 1: hold the radio where it is (nothing is read)
+  float grain_wash;                    // the grain engine's own reverb, 0..1 (WASH)
 };
+
+const int kRadioFrames = 48000 * 4;   // 4 s ring buffer the radio feeder thread fills
+
+enum { kBusBalls, kBusRings, kBusGrains, kBusDrums, kBusWarp, kBusRadio, kBuses };
 
 const int kScatterMode = 4;            // grain_mode index of SCATTER (after the four cloud modes)
 
@@ -225,6 +243,25 @@ struct Engine {
   float grain_clock = 0;
   Mods mods;
   Drums drums;
+  double beats = 0;                    // master clock, in beats since start
+  double chunk_from = 0;               // ... at the start of the chunk being rendered
+  bool release_hits = true;            // false: quantized hits wait for the next grid line
+  float bus[kBuses] = {1, 1, 1, 1, 1, 1};   // faded tab gains
+  // RADIO: decoded 48 kHz stereo from a feeder thread. Own lock: the feeder never waits on
+  // the engine's, and the audio thread plays silence when the buffer runs dry.
+  std::mutex radio_lock;
+  std::vector<int16_t> radio_buf = std::vector<int16_t>(2 * kRadioFrames);
+  long radio_read = 0, radio_write = 0;     // frame counters (modulo kRadioFrames)
+
+  void render_radio(float* l, float* r) {
+    float g = p.radio_level * bus[kBusRadio];
+    if (p.radio_paused) return;
+    std::lock_guard<std::mutex> lk(radio_lock);
+    for (int i = 0; i < kChunk && radio_read < radio_write; ++i, ++radio_read) {
+      long at = 2 * (radio_read % kRadioFrames);
+      if (g > 0) { l[i] += g * radio_buf[at] / 32768.0f; r[i] += g * radio_buf[at + 1] / 32768.0f; }
+    }
+  }
   Warp warp;
   Scatter scatter;
 
@@ -267,7 +304,7 @@ struct Engine {
     rings_live = 4;
     ring_count_live = ring_count;
     for (int k = 0; k < ring_count; ++k) { ring_notes_live[k] = ring_midis[k]; ring_gains_live[k] = ring_gains[k]; }
-    while (!incoming.empty()) {
+    while (release_hits && !incoming.empty()) {
       Sample s = std::move(incoming.front());
       incoming.pop_front();
       if (s.group >= 0 && s.poly > 0) {                        // choke the oldest beyond poly
@@ -300,7 +337,7 @@ struct Engine {
       ps.internal_exciter = false;
       {
         std::lock_guard<std::mutex> g(lock);
-        if (!strikes.empty()) {
+        if (release_hits && !strikes.empty()) {
           Strike s = strikes.front();
           strikes.pop_front();
           ps.strum = true;
@@ -335,7 +372,7 @@ struct Engine {
   void render_synth(float* l, float* r) {
     {
       std::lock_guard<std::mutex> g(lock);
-      while (!synth_hits.empty()) {
+      while (release_hits && !synth_hits.empty()) {
         Hit h = synth_hits.front();
         synth_hits.pop_front();
         SynthVoice& v = synth[synth_next];
@@ -392,7 +429,7 @@ struct Engine {
     ep->modulation_frequency = 0.0f;
     {
       std::lock_guard<std::mutex> g(lock);
-      if (!physical_hits.empty()) {
+      if (release_hits && !physical_hits.empty()) {
         Hit h = physical_hits.front();
         physical_hits.pop_front();
         physical_note = h.note;
@@ -458,7 +495,7 @@ struct Engine {
     cp->dry_wet = 1.0f;                                    // wet only; dry stays in our mix
     cp->stereo_spread = p.grain_spread;
     cp->feedback = kFeedbackMax * p.grain_feedback;
-    cp->reverb = 0.0f;                                     // the master reverb handles space
+    cp->reverb = p.grain_wash;                             // the module's own cloud reverb: the pad wash
     cp->freeze = p.grain_freeze != 0;
     cp->trigger = false;
     cp->gate = false;
@@ -490,8 +527,8 @@ struct Engine {
     for (int i = 0; i < kChunk; ++i) {
       float cl = out[std::min(k, kCloudsBlock - 1)].l / 32768.0f;
       float cr = out[std::min(k, kCloudsBlock - 1)].r / 32768.0f;
-      l[i] += p.grain_level * (1.6f / kCloudsDrive) * (up_prev_l + (cl - up_prev_l) * up_pos);
-      r[i] += p.grain_level * (1.6f / kCloudsDrive) * (up_prev_r + (cr - up_prev_r) * up_pos);
+      l[i] += p.grain_level * wet_limit((kCloudsOut / kCloudsDrive) * (up_prev_l + (cl - up_prev_l) * up_pos));
+      r[i] += p.grain_level * wet_limit((kCloudsOut / kCloudsDrive) * (up_prev_r + (cr - up_prev_r) * up_pos));
       up_pos += 2.0f / 3.0f;
       if (up_pos >= 1.0f) { up_pos -= 1.0f; up_prev_l = cl; up_prev_r = cr; ++k; }
     }
@@ -504,7 +541,12 @@ struct Engine {
     bool any = false;
     for (int k = 0; k < kModLanes; ++k) any |= p.mod_target[k] > 0 && p.mod_depth[k] != 0;
     if (!any) return;
-    mods.step(p.mod_mode, p.mod_rate, p.mod_shape, p.mod_slope, p.mod_smooth, p.mod_shift);
+    float ramp = -1.0f;
+    if (p.mod_cycle > 0) {
+      double pos = beats * p.mod_ratio / p.mod_cycle;
+      ramp = float(pos - std::floor(pos));
+    }
+    mods.step(p.mod_mode, p.mod_rate, p.mod_shape, p.mod_slope, p.mod_smooth, p.mod_shift, ramp);
     for (int k = 0; k < kModLanes; ++k) {
       float* slot = mod_slot(p, p.mod_target[k]);
       if (!slot) continue;
@@ -514,9 +556,35 @@ struct Engine {
     }
   }
 
+  // Advance the master clock one chunk; quantized hits go out when a grid line is crossed.
+  void advance_clock() {
+    chunk_from = beats;
+    beats += double(kChunk) * std::max(1.0f, p.bpm) / (60.0 * kRate);
+    if (p.quant <= 0) { release_hits = true; return; }
+    double grid = p.quant * std::max(0.01f, p.ball_ratio);          // grid lines per master beat
+    release_hits = std::floor(beats * grid) > std::floor(chunk_from * grid);
+  }
+
+  void fade_buses() {
+    for (int b = 0; b < kBuses; ++b) {
+      float target = std::max(0.0f, std::min(1.0f, p.bus_on[b]));
+      bus[b] += std::max(-0.05f, std::min(0.05f, target - bus[b]));   // ~20 ms fade
+    }
+  }
+
+  static void scale(float* l, float* r, float g) {
+    if (g == 1.0f) return;
+    for (int i = 0; i < kChunk; ++i) { l[i] *= g; r[i] *= g; }
+  }
+
   void render_chunk(int16_t* out) {
+    { std::lock_guard<std::mutex> g(lock); p = staged; }
+    advance_clock();
     apply_staging();
+    fade_buses();
+    p.warp_mix *= bus[kBusWarp];
     apply_mods();
+    p.grain_level *= bus[kBusGrains];
     float balls_l[kChunk]{}, balls_r[kChunk]{}, rings_l[kChunk]{}, rings_r[kChunk]{};
     render_resonator(balls_l, balls_r);
     render_synth(balls_l, balls_r);
@@ -532,8 +600,11 @@ struct Engine {
       ring[k].render(rings_l, rings_r, kChunk, std::max(0, std::min(4, p.ring_timbre)),
                      0.3f * p.ring_level, 0.2f + 0.2f * k);
     float drums_l[kChunk]{}, drums_r[kChunk]{};
-    drums.render(drums_l, drums_r, kChunk, p.drum_play != 0, p.drum_bpm, p.drum_x, p.drum_y, p.drum_chaos,
-                 p.drum_density, p.drum_level, p.drum_tone, p.drum_decay, p.drum_note);
+    scale(balls_l, balls_r, bus[kBusBalls]);
+    scale(rings_l, rings_r, bus[kBusRings]);
+    drums.render(drums_l, drums_r, kChunk, p.drum_play != 0, beats * p.drum_ratio, p.drum_x, p.drum_y,
+                 p.drum_chaos, p.drum_density, p.drum_level, p.drum_tone, p.drum_decay, p.drum_note);
+    scale(drums_l, drums_r, bus[kBusDrums]);
     render_warp(balls_l, balls_r, rings_l, rings_r, drums_l, drums_r);
     float src_l[kChunk], src_r[kChunk];
     for (int i = 0; i < kChunk; ++i) {        // ALL feeds the grains the drums too
@@ -551,8 +622,11 @@ struct Engine {
       float wet_l[kChunk]{}, wet_r[kChunk]{};
       if (p.grain_level > 0)
         scatter.render(src_l, src_r, wet_l, wet_r, kChunk, p.grain_density, p.grain_size, p.grain_position,
-                       p.grain_texture, p.grain_pitch, p.grain_spread, p.grain_feedback, p.grain_freeze != 0);
-      for (int i = 0; i < kChunk; ++i) { mix_l[i] += p.grain_level * wet_l[i]; mix_r[i] += p.grain_level * wet_r[i]; }
+                       p.grain_texture, p.grain_pitch, p.grain_spread, p.grain_feedback, p.grain_freeze != 0,
+                       p.grain_wash);
+      for (int i = 0; i < kChunk; ++i) {
+        mix_l[i] += p.grain_level * wet_limit(wet_l[i]); mix_r[i] += p.grain_level * wet_limit(wet_r[i]);
+      }
       float rate = std::fabs(p.grain_density) * 40.0f;           // visual sparks only
       if (p.grain_level > 0) { grain_clock += rate * kChunk / kRate; grains += long(grain_clock); grain_clock -= long(grain_clock); }
     } else {
@@ -563,6 +637,9 @@ struct Engine {
     for (int i = 0; i < kChunk; ++i) { frames[i].l = mix_l[i]; frames[i].r = mix_r[i]; }
     reverb.set_amount(0.6f * p.reverb);
     reverb.Process(frames, kChunk);
+    float radio_l[kChunk]{}, radio_r[kChunk]{};
+    render_radio(radio_l, radio_r);       // after the reverb: a finished track needs no more room
+    for (int i = 0; i < kChunk; ++i) { frames[i].l += radio_l[i]; frames[i].r += radio_r[i]; }
     for (int i = 0; i < kChunk; ++i) {
       out[2 * i] = int16_t(32000.0f * std::tanh(p.volume * frames[i].l));
       out[2 * i + 1] = int16_t(32000.0f * std::tanh(p.volume * frames[i].r));
@@ -663,6 +740,37 @@ float tc_seq_next(void* h, float deja_vu, int length) {
   s->sequence.set_length(length);
   return s->sequence.NextValue(false, 0.0f);
 }
+
+// RADIO: queue decoded 48 kHz stereo s16 frames; returns how many fit (0 = full, try later).
+int tc_radio_push(void* h, const int16_t* data, int frames) {
+  Engine* e = static_cast<Engine*>(h);
+  std::lock_guard<std::mutex> lk(e->radio_lock);
+  long room = kRadioFrames - (e->radio_write - e->radio_read);
+  int n = int(std::min<long>(room, frames));
+  for (int i = 0; i < n; ++i, ++e->radio_write) {
+    long at = 2 * (e->radio_write % kRadioFrames);
+    e->radio_buf[at] = data[2 * i];
+    e->radio_buf[at + 1] = data[2 * i + 1];
+  }
+  return n;
+}
+
+// Drop whatever is queued (a new track, or the radio stopped).
+void tc_radio_clear(void* h) {
+  Engine* e = static_cast<Engine*>(h);
+  std::lock_guard<std::mutex> lk(e->radio_lock);
+  e->radio_read = e->radio_write;
+}
+
+// Seconds of radio audio queued.
+float tc_radio_queued(void* h) {
+  Engine* e = static_cast<Engine*>(h);
+  std::lock_guard<std::mutex> lk(e->radio_lock);
+  return float(e->radio_write - e->radio_read) / kRate;
+}
+
+// The master clock, in beats since start.
+double tc_beats(void* h) { return static_cast<Engine*>(h)->beats; }
 
 // The four MODS lanes' latest values (-1..1), for the meters and for TILT.
 void tc_mods(void* h, float* out) {

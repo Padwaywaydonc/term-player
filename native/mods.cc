@@ -15,7 +15,8 @@ void Mods::init() { impl = new Impl(); impl->generator.Init(); }
 
 Mods::~Mods() { delete impl; }
 
-void Mods::step(int output_mode, float rate_hz, float shape, float slope, float smooth, float shift) {
+void Mods::step(int output_mode, float rate_hz, float shape, float slope, float smooth, float shift,
+                float ramp) {
   static const tides::OutputMode kModes[3] = {
       tides::OUTPUT_MODE_SLOPE_PHASE, tides::OUTPUT_MODE_FREQUENCY, tides::OUTPUT_MODE_AMPLITUDE};
   output_mode = std::max(0, std::min(2, output_mode));
@@ -25,6 +26,7 @@ void Mods::step(int output_mode, float rate_hz, float shape, float slope, float 
   }
   tides::PolySlopeGenerator::OutputSample sample;
   impl->generator.Render(tides::RAMP_MODE_LOOPING, kModes[output_mode], tides::RANGE_CONTROL,
-                         rate_hz / kControlRate, slope, shape, smooth, shift, impl->gates, nullptr, &sample, 1);
+                         rate_hz / kControlRate, slope, shape, smooth, shift, impl->gates,
+                         ramp >= 0 ? &ramp : nullptr, &sample, 1);
   for (int k = 0; k < kModLanes; ++k) out[k] = std::max(-1.0f, std::min(1.0f, sample.channel[k] / 5.0f));
 }

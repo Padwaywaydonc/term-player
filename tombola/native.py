@@ -56,7 +56,12 @@ class TcParams(ctypes.Structure):     # mirrors Params in native/tombola_core.cc
                 ("drum_note", ctypes.c_float),
                 ("mod_mode", ctypes.c_int), ("mod_rate", ctypes.c_float), ("mod_shape", ctypes.c_float),
                 ("mod_slope", ctypes.c_float), ("mod_smooth", ctypes.c_float), ("mod_shift", ctypes.c_float),
-                ("mod_target", ctypes.c_int * 4), ("mod_depth", ctypes.c_float * 4)]
+                ("mod_target", ctypes.c_int * 4), ("mod_depth", ctypes.c_float * 4),
+                ("bpm", ctypes.c_float), ("ball_ratio", ctypes.c_float), ("drum_ratio", ctypes.c_float),
+                ("mod_ratio", ctypes.c_float), ("quant", ctypes.c_int), ("mod_cycle", ctypes.c_float),
+                ("bus_on", ctypes.c_float * 6), ("radio_level", ctypes.c_float), ("radio_paused", ctypes.c_int),
+                ("grain_wash", ctypes.c_float)]
+BUSES = ("balls", "rings", "grains", "drums", "warp", "radio")      # order of bus_on in the core
 
 
 def load():
@@ -90,6 +95,13 @@ def load():
     lib.tc_drum_step.argtypes = [ctypes.c_void_p]
     lib.tc_drum_step.restype = ctypes.c_int
     lib.tc_drum_levels.argtypes = [ctypes.c_void_p, ctypes.c_float, ctypes.c_float, ctypes.POINTER(ctypes.c_uint8)]
+    lib.tc_radio_push.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+    lib.tc_radio_push.restype = ctypes.c_int
+    lib.tc_radio_clear.argtypes = [ctypes.c_void_p]
+    lib.tc_radio_queued.argtypes = [ctypes.c_void_p]
+    lib.tc_radio_queued.restype = ctypes.c_float
+    lib.tc_beats.argtypes = [ctypes.c_void_p]
+    lib.tc_beats.restype = ctypes.c_double
     return lib
 
 
@@ -127,6 +139,10 @@ class NativeMixer:
                           tone=0.5, decay=0.5, note=28.0)
         self.mods = dict(mode=0, rate=0.2, shape=0.5, slope=0.5, smooth=0.5, shift=0.5,
                          targets=(0, 0, 0, 0), depths=(0.0, 0.0, 0.0, 0.0))
+        self.clock = dict(bpm=112.0, ball_ratio=1.0, drum_ratio=1.0, mod_ratio=1.0, quant=0, mod_cycle=0.0)
+        self.buses = {b: 1.0 for b in BUSES}
+        self.radio_level = 0.5
+        self.radio_paused = False
         self.cache = {}
         self._params = TcParams()
         self._out = (ctypes.c_int16 * (BLOCK * CHANNELS))()
@@ -182,6 +198,21 @@ class NativeMixer:
         self.lib.tc_mods(self.handle, out)
         return list(out)
 
+    def beats(self):
+        """The master clock: beats since the core started."""
+        return self.lib.tc_beats(self.handle)
+
+    def radio_push(self, pcm):
+        """Queue 48 kHz stereo s16 bytes; returns how many bytes were taken (0: buffer full)."""
+        return 4 * self.lib.tc_radio_push(self.handle, pcm, len(pcm) // 4)
+
+    def radio_clear(self):
+        self.lib.tc_radio_clear(self.handle)
+
+    def radio_queued(self):
+        """Seconds of radio queued."""
+        return self.lib.tc_radio_queued(self.handle)
+
     def drum_step(self):
         return self.lib.tc_drum_step(self.handle)
 
@@ -222,6 +253,12 @@ class NativeMixer:
         p.mod_mode, p.mod_rate, p.mod_shape, p.mod_slope = m["mode"], m["rate"], m["shape"], m["slope"]
         p.mod_smooth, p.mod_shift = m["smooth"], m["shift"]
         p.mod_target[:], p.mod_depth[:] = m["targets"], m["depths"]
+        k = self.clock
+        p.bpm, p.ball_ratio, p.drum_ratio, p.mod_ratio = k["bpm"], k["ball_ratio"], k["drum_ratio"], k["mod_ratio"]
+        p.quant, p.mod_cycle = k["quant"], k["mod_cycle"]
+        p.bus_on[:] = [self.buses[b] for b in BUSES]
+        p.radio_level, p.radio_paused = self.radio_level, int(self.radio_paused)
+        p.grain_wash = getattr(c, "wash", 0.0)
         self.lib.tc_set_params(self.handle, ctypes.byref(p))
         n = n // 48 * 48
         out = self._out if n == BLOCK else (ctypes.c_int16 * (n * CHANNELS))()

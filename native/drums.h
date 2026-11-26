@@ -11,6 +11,7 @@
 //   Y: sparse .. busy (ghost notes, fills, more off-grid hits)
 // plus a fixed pseudo-random variation per node, so neighbouring nodes differ.
 #pragma once
+#include <cmath>
 #include <cstdint>
 
 #include "synth_voice.h"
@@ -86,8 +87,8 @@ struct DrumMap {
 struct Drums {
   DrumMap map;
   SynthVoice voice[kDrumParts];
-  float phase = 0;                     // fraction of the current step
   int step = 0;
+  long last_step = -1;                 // absolute step count at the last hit check
   uint8_t lift[kDrumParts]{};          // CHAOS: this bar's random lift per part
   uint32_t rng = 12345;
   int idle = 0;                        // chunks since PLAY went off: let the last hits ring out
@@ -99,19 +100,21 @@ struct Drums {
 
   float random01() { rng = rng * 1664525u + 1013904223u; return (rng >> 8) / 16777216.0f; }
 
-  // Advance by one chunk; render the three voices into l/r (n = 48).
-  void render(float* l, float* r, int n, bool play, float bpm, float x, float y, float chaos,
+  // Render one chunk into l/r (n = 48). beat_to: the drums' clock position (in beats) at the
+  // chunk's end; every 1/8 beat crossed since the last chunk is a step.
+  void render(float* l, float* r, int n, bool play, double beat_to, float x, float y, float chaos,
               const float* density, float level, float tone, float decay, float note) {
     static const int kEngine[kDrumParts] = {21, 22, 23};       // kick, snare, hi-hat engines
     static const float kNote[kDrumParts] = {0, 36, 60};        // above the key's low root
     static const float kPan[kDrumParts] = {0.5f, 0.45f, 0.6f};
     idle = play ? 0 : idle + 1;
     if (idle > 2000) return;           // ~2 s after stopping: silent, skip the voices
+    long now = long(std::floor(beat_to * 8.0));                // 8 steps per beat
+    if (!play || last_step < 0 || now < last_step || now - last_step > kDrumSteps) last_step = now;
     if (play) {
-      phase += n * bpm * 8.0f / (60.0f * 48000.0f);           // 8 steps per beat
-      while (phase >= 1.0f) {
-        phase -= 1.0f;
-        step = (step + 1) % kDrumSteps;
+      while (last_step < now) {
+        ++last_step;
+        step = int(((last_step % kDrumSteps) + kDrumSteps) % kDrumSteps);   // the bar follows the clock
         if (step == 0)
           for (auto& d : lift) d = uint8_t(255.0f * chaos * 0.5f * random01());
         for (int p = 0; p < kDrumParts; ++p) {

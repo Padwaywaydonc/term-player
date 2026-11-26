@@ -20,6 +20,11 @@ RATIOS = {                       # orbit speed of each ring relative to the inne
     "SYNC": (1, 1, 1, 1),
 }
 TAU = 2 * math.pi
+# SYNC: each ring's orbit as a multiple of the innermost one's (in bars), per RATIO, so every
+# moon reaches the top on the clock's grid.
+SYNC_MULTIPLES = {"KEPLER": (1, 1.5, 2, 3), "HARM": (1, 2, 3, 4), "PRIME": (1, 1.5, 2.5, 3.5),
+                  "GOLD": (1, 1.5, 2.5, 4), "SYNC": (1, 1, 1, 1)}
+PULL = 0.02                      # per step: how fast a synced ring drifts back onto the grid
 
 
 class Rings:
@@ -48,6 +53,17 @@ class Rings:
         self.time += dt
         for k in range(self.count):
             self.phase[k] += self.omega(k) * dt
+
+    def step_synced(self, dt, dbeats, beats, orbit_beats):
+        """SYNC: ring k orbits once per orbit_beats * its multiple (beats of the rings' clock),
+        moving with the clock and pulled gently onto it, so changing BPM or ORBIT never jumps."""
+        self.time += dt
+        top = self.top_angle()
+        for k in range(self.count):
+            period = orbit_beats * SYNC_MULTIPLES[self.ratio][k]
+            target = top + TAU * beats / period                 # moon 0 at the top on each period
+            error = (target - self.phase[k] + math.pi) % TAU - math.pi
+            self.phase[k] += TAU * dbeats / period + PULL * error
 
     def top_angle(self):
         """Orbit angle of every ring's highest point on screen (all rings share the shape)."""

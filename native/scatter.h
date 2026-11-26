@@ -13,7 +13,7 @@ struct Scatter {
   // density: -1..1; size, position, texture, spread, feedback: 0..1; pitch in semitones.
   void render(const float* in_l, const float* in_r, float* out_l, float* out_r, int n,
               float density, float size, float position, float texture, float pitch,
-              float spread, float feedback, bool freeze);
+              float spread, float feedback, bool freeze, float wash);
  private:
   struct Impl;
   Impl* impl = nullptr;

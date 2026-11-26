@@ -58,6 +58,7 @@ Make sure `~/.local/bin` is on your `PATH`. Or just copy `play` anywhere on your
 ## Usage
 
 ```bash
+play                                    # no search words: opens tombola (below)
 play lofi hip hop                       # search YouTube, start playing
 play --provider soundcloud ambient      # use SoundCloud
 play --provider spotify --pos left tycho
@@ -88,9 +89,10 @@ play --size 25 --pos bottom synthwave   # 25%-tall pane along the bottom
 ## Tombola — generative synth
 
 ```bash
-play --tombola                 # opens in the same tmux split as the player
-play --tombola --size 40       # a taller pane for the full knob layout
-play --tombola --audio native  # force PulseAudio/pacat instead of Windows mpv.exe
+play                           # plain play opens tombola, in the same tmux split as the player
+play --size 40                 # a taller pane for the full knob layout
+play --audio native            # force PulseAudio/pacat instead of Windows mpv.exe
+play --tombola                 # still works (same as plain play)
 ```
 
 It uses `play`'s `--size` / `--pos` split (default: a small strip along the
@@ -143,9 +145,13 @@ Saturn rings:
   `DENSITY` (negative = steady rate, 0 = none, positive = random), `SIZE`,
   `POSITION` (how far back), `PITCH` (±12 semitones), `SPREAD` (stereo spread),
   `TEXTURE` (grain window: square → triangle → smooth, then a smearing diffuser),
-  `FEEDBACK` (grains re-recorded; capped so it always dies away), `FREEZE` (stop
+  `FEEDBACK` (grains re-recorded; from about 75% in `GRANULAR`, `SPECTRAL` and
+  `SCATTER` the cloud feeds itself and keeps going as an endless bed after the
+  source stops; turn it down to let it fade), `WASH` (the grain engine's own
+  reverb, as on the module: smears grains into a pad), `FREEZE` (stop
   recording and keep granulating what's in the buffer; also `f`) and `GRAIN`
-  (level). Each grain shows as a brief spark.
+  (level; the grains can sit as loud as the dry sound, softly limited so they
+  never clip). Each grain shows as a brief spark.
 
 - **Arpeggio** — `ARP` on the BALLS page (`UP` `DOWN` `UP-DN` `RANDOM`): every
   hit, with any instrument, plays the next note of the current chord (1-3-5-7
@@ -153,8 +159,8 @@ Saturn rings:
 - **Drums** — the `DRUMS` page. A drum-pattern map: `MAP X` goes from straight
   (four-on-the-floor kick, backbeat, offbeat hats) to broken, `MAP Y` from
   sparse to busy; `KICK` `SNARE` `HATS` set how many of each part's steps play,
-  `CHAOS` adds random extra hits each bar. `PLAY` starts it (it never starts on
-  its own, `r` leaves it alone), `BPM`, `TONE`, `DECAY`, `VOL`. The kick follows
+  `CHAOS` adds random extra hits each bar. The tab starts off: `o` switches it on
+  (`r` leaves it alone). `TONE`, `DECAY`, `VOL`. The kick follows
   the key. The top row shows the bar as sixteenths (`K` kick, `S` snare, `X`
   both, `H` hats; accents amber, the playing step lit).
 - **Warp** — the `WARP` page: the balls cross-modulate a `CARRIER` (the rings,
@@ -170,14 +176,44 @@ Saturn rings:
   (`TO 1`…`TO 4`) at a sound setting — grain position/size/density/texture/level,
   the synth, resonator or physical voice, ring timbre, pad, reverb, warp, drum
   map, chaos, or the rings' `TILT` — with a `DEPTH` of ±100%. The top row shows
-  the four lanes live.
+  the four lanes live. With `SYNC` on (default) `CYCLE` sets one movement in bars
+  of the clock, locked to the bar; off, `RATE` runs it freely.
+- **Radio** — the `RADIO` tab is `play`'s music player inside tombola's mix,
+  with the same keys: `←` / `→` seek ∓10 s, `↑` / `↓` volume, `Space` pause,
+  `n` / `p` next / previous, `l` the track list (arrows to navigate, type to
+  search, Enter plays, Esc back; `/` or Enter open it too), `s` next source
+  (`YOUTUBE` `SOUNDCLOUD` `SPOTIFY`; switching searches again). The page shows
+  what's playing, a progress bar with the time, volume and source, and the
+  results. It plays the ten results one after another. Spotify uses the API keys
+  saved by `play`'s settings and plays each hit's YouTube match, as `play` does.
+  Like `play`, it downloads each track with `yt-dlp` (to a temp folder removed on
+  quit) and decodes it with `ffmpeg` — both must be installed; the last search is
+  remembered.
+
+**Every tab has an on/off switch: `o`.** Off tabs are struck through in the tab
+row. BALLS off: the balls keep bouncing silently; RINGS off: no chord tones or
+pad; CHORDS off: the chord stays put; GRAINS, DRUMS, WARP, MODS, RADIO off: that
+part goes quiet (with a short fade). So you can run just the radio, or just
+rings and drums. `Space` still switches everything off at once; `u` (undo) never
+changes the switches.
+
+**Master clock.** `BPM` (10–200, on every timed page — it's one setting) is the
+master; each timed tab (BALLS, RINGS, CHORDS, DRUMS, MODS) has `CLK`, a division
+or multiple of it (`/8` `/4` `/3` `/2` `x1` `x2` `x3` `x4`), like clock dividers on
+a modular rig: tabs can run at different speeds but always meet on the master's
+downbeats. Following it: the drums' steps; ball hits with `QUANT` (`1/16` by
+default: a hit waits for the next sixteenth; `OFF` plays at once); the rings with
+`SYNC` on (default: the inner ring orbits once every `ORBIT` bars, the outer ones
+at fixed multiples, so moons peak on the grid — the `MOON` chord clock follows);
+the `BARS` chord clock (`CLOCK` `BARS`: change every `BARS` bars); and MODS with
+`SYNC`. With the native core the clock is the audio sample counter, so it's exact.
 
 **Audio engine.** `./install.sh` builds a small native core (`native/`, needs
 `make` and `g++`): 48 kHz stereo, with the resonator, granular processor and
 reverb, synth voice, physical-modelling voice and random-sequence DSP from
 Emilie Gillet's open-source eurorack code (MIT — see `NOTICE`), plus the
 ring-chord voices and the mix. `SYNTH` and `PHYSICAL` ball voices, the
-synth-engine ring timbres, `SCATTER`, and the DRUMS, WARP and MODS pages need it
+synth-engine ring timbres, `SCATTER`, and the DRUMS, WARP, MODS and RADIO pages need it
 (the Python engine stands in with `BELL`, `MARIMBA` and `WARM`, and shows
 DRUMS / MODS as `48K ONLY`). If it isn't built, tombola falls back to
 its pure-Python engine (22.05 kHz mono, simplified resonator and grains); the
@@ -213,27 +249,36 @@ random sequence and each value maps to a chord on a colourful → stable ladder:
 chord lit and freshly regenerated ones marked with a dot. `g` regenerates the
 whole loop, `x` holds the current chord.
 
-Settings are split over seven pages — `Tab` switches:
+Settings are split over eight pages — `Tab` switches:
 
 | Page    | Settings |
 |---------|----------|
 | `BALLS` | `KEY` `SCALE` `INSTR` `ARP` `ATTACK` `RELEASE` `SHAPE` `VISUAL` `BALLS` `GRAV` `ROT` `BOUNCE` `OCTAVE` `REVERB` `GRAIN` `VOL` (ball volume); with `INSTR` `RESONATOR`: `MODEL` `STRUCTURE` `BRIGHTNESS` `DAMPING` `POSITION` `POLY` in place of `ATTACK` `RELEASE` |
 | `CHORDS` | `KEY` `SCALE` `CHORD` `CLOCK` (`MOON` `TIME`) `VISUAL` `WINDOW` `CHANGE` `JITTER` `CHANCE` `LENGTH` `DEJA VU` `SPREAD` `BIAS` `OCTAVE` |
-| `GRAINS` | `KEY` `SCALE` `SOURCE` (`ALL` `BALLS` `RINGS`) `MODE` `FREEZE` `VISUAL` `WINDOW` `GRAIN` (level) `DENSITY` `SIZE` `POSITION` `PITCH` `SPREAD` `TEXTURE` `FEEDBACK` `REVERB` |
-| `DRUMS` | `KEY` `SCALE` `PLAY` `VISUAL` `WINDOW` `BPM` `MAP X` `MAP Y` `CHAOS` `KICK` `SNARE` `HATS` `TONE` `DECAY` `VOL` |
+| `GRAINS` | `KEY` `SCALE` `SOURCE` (`ALL` `BALLS` `RINGS`) `MODE` `FREEZE` `VISUAL` `WINDOW` `GRAIN` (level) `DENSITY` `SIZE` `POSITION` `PITCH` `SPREAD` `TEXTURE` `FEEDBACK` `WASH` `REVERB` |
+| `DRUMS` | `KEY` `SCALE` `VISUAL` `WINDOW` `MAP X` `MAP Y` `CHAOS` `KICK` `SNARE` `HATS` `TONE` `DECAY` `VOL` `BPM` `CLK` |
 | `WARP` | `KEY` `SCALE` `CARRIER` (`RINGS` `DRUMS` `SINE` `TRI` `SAW`) `VISUAL` `WINDOW` `ALGO` `TIMBRE` `DRIVE` `MIX` |
-| `MODS` | `KEY` `SCALE` `MODE` (`PHASE` `FREQ` `AMP`) `VISUAL` `WINDOW` `RATE` `SHAPE` `SLOPE` `SMOOTH` `SHIFT` `TO 1`…`TO 4` with a `DEPTH` each |
+| `MODS` | `KEY` `SCALE` `MODE` (`PHASE` `FREQ` `AMP`) `SYNC` `VISUAL` `WINDOW` `CYCLE` (or `RATE` with `SYNC` off) `SHAPE` `SLOPE` `SMOOTH` `SHIFT` `TO 1`…`TO 4` with a `DEPTH` each, `BPM` `CLK` |
+| `RADIO` | `SOURCE` (`YOUTUBE` `SOUNDCLOUD` `SPOTIFY`) `VISUAL` `WINDOW` `VOL` |
+
+BALLS also has `QUANT`, `BPM` and `CLK`; RINGS `SYNC`, `ORBIT` (in place of
+`SPEED` while synced), `BPM` and `CLK`; CHORDS `CLOCK` `BARS`, `BPM` and `CLK`.
 | `RINGS` | `KEY` `SCALE` `INSTR` (ring timbre: `WARM` `GLASS` `SINE` `ORGAN` `SAW`) `CHORD` (held degree `I`…`VII`, or a progression) `RATIO` (orbit speeds: `KEPLER` outer-slower, `HARM`, `PRIME`, `GOLD`, `SYNC`) `VISUAL` `WINDOW` `RINGS` (chord notes, 0–4) `MOONS` (swells per orbit) `SPEED` `TILT` `OCTAVE` (−3…+3; 0 = lowest clearly audible, below = sub-bass) `PAD` (ring level) `FLOOR` (volume with the moon at its lowest: 0% silent … 100% drone) `REVERB` `GRAIN` `VOL` (ring volume) |
 
 In a full-size pane every setting of the page is a knob along the bottom.
 
 | Key            | Action                                    |
 |----------------|-------------------------------------------|
-| `Tab`          | switch page: BALLS / RINGS / CHORDS / GRAINS / DRUMS / WARP / MODS |
+| `Tab`          | switch page: BALLS / RINGS / CHORDS / GRAINS / DRUMS / WARP / MODS / RADIO |
+| `o`            | this tab on / off                         |
+| RADIO page     | play's keys: `←→` seek, `↑↓` volume, `Space` pause, `n`/`p` next/prev, `l` list (type to search), `s` source |
 | `←` / `→`      | select setting (also `h` / `l`)           |
 | `↑` / `↓`      | change it (also `k` / `j`)                |
 | `3` … `8`      | BALLS page: shape — triangle, square, pentagon … octagon |
 | `1` … `7`      | RINGS / CHORDS page: hold chord I … VII   |
+| `1` … `4`      | MODS page: jump to mover 1 … 4 (its `TO` setting) |
+| `1` … `5`      | WARP page: carrier RINGS / DRUMS / SINE / TRI / SAW |
+| `?`            | help: a plain-words line about the selected setting (follows the cursor; `?` again hides it) |
 | `g`            | regenerate the RANDOM chord loop          |
 | `x`            | hold the current chord (no changes)       |
 | `s` / `S`      | next / previous shape                     |
@@ -245,12 +290,25 @@ In a full-size pane every setting of the page is a knob along the bottom.
 | `f`            | freeze the grain buffer                   |
 | `Space`        | on / off (freezes everything, mutes the pad) |
 | `r`            | random: rolls only the page shown (BALLS also drops fresh balls); never VOL or shared settings (KEY, SCALE, CHORD, ring OCTAVE, REVERB, GRAIN, VISUAL, WINDOW), DRUMS `PLAY` or WARP `MIX` |
-| `u`            | undo the last `r` (remembers the last 20 rolls, across restarts) |
+| `u`            | undo the last `r` or preset load (remembers the last 20, across restarts) |
+| `P` then `1`-`9` | save a preset to that slot              |
+| `L` then `1`-`9` | load a preset (any other key cancels)   |
 | `q`            | quit                                      |
 
 Settings are saved to `~/.config/play-tombola.json` after every change and come
 back the next time you open it, so a sound you like is still there — even if
-the pane was closed without `q`. The code lives in
+the pane was closed without `q`. The RANDOM chord loop is drawn from a seed
+that is saved too, so the same loop comes back after a restart (`g` draws a new
+loop with a new seed).
+
+**Presets.** `P` then a digit saves everything (every setting except WINDOW,
+the chord loop's seed and the radio search) to slot 1-9 in
+`~/.config/play-tombola-presets/slot-N.json`; `L` then a digit loads it, with
+the same RANDOM chord loop and the same CHANCE / JITTER / ARP RANDOM coin
+tosses. `u` undoes a load. Ball positions are not part of a preset: the
+physics runs in real time.
+
+The code lives in
 `tombola/` (physics, rings, synth, audio output, UI, params). Tests:
 `python3 test/test_tombola.py` and `test/e2e-tombola.sh`.
 

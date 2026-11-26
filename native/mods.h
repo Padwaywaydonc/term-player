@@ -14,7 +14,9 @@ struct Mods {
   void init();
   ~Mods();
   // rate_hz: speed; shape, slope, smooth, shift: 0..1 like the module's knobs.
-  void step(int output_mode, float rate_hz, float shape, float slope, float smooth, float shift);
+  // ramp >= 0: locked to the clock (ramp = position in the cycle, 0..1); else free at rate_hz.
+  void step(int output_mode, float rate_hz, float shape, float slope, float smooth, float shift,
+            float ramp = -1.0f);
  private:
   struct Impl;
   Impl* impl = nullptr;

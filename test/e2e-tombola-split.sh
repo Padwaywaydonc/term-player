@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# E2E test for `play --tombola` inside tmux: like the music player it must open
+# E2E test for plain `play` (tombola) inside tmux: like the music player it must open
 # in a small split (play's default is 10% along the top), draw the compact
 # layout there — canvas, both page tabs, the selected setting, key hints —
 # react to keys, and close its pane on quit.
@@ -41,7 +41,7 @@ chmod +x "$WORK/bin/mpv.exe"
 FAIL=0
 fail() { echo "FAIL: $*"; FAIL=1; }
 
-T new-session -d -s t -x 160 -y 50 "bash -c '$PLAY_BIN --tombola --size 10 --pos top --audio wsl; sleep 60'"
+T new-session -d -s t -x 160 -y 50 "bash -c '$PLAY_BIN --size 10 --pos top --audio wsl; sleep 60'"
 sleep 3
 
 PANES=$(T list-panes -t t -F '#{pane_index} #{pane_height}')
