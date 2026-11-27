@@ -231,9 +231,16 @@ def _knob_rows(params, width):
 
 
 def knob_layout_fits(state, cols, rows):
-    """True when the full layout (scene + every setting as a knob) has room."""
+    """True when the full layout (scene + every setting as a knob) has room. With the scene
+    drawn elsewhere (WINDOW backdrop or BEHIND) the knobs get its rows."""
     n = len(_knob_rows(state["side"] + state["knobs"], cols - 4))
-    return rows >= 3 + MIN_SCENE_ROWS + 4 * n + 1
+    scene_rows = MIN_SCENE_ROWS if state.get("radio") or not _scene_elsewhere(state) else 0
+    return rows >= 3 + scene_rows + 4 * n + 1
+
+
+def _scene_elsewhere(state):
+    """The world is already shown behind the pane (BEHIND) or in the window: don't draw it twice."""
+    return _visual(state) == "BEHIND" or bool(state.get("window"))
 
 
 SHORT = {"ATTACK": "ATK", "RELEASE": "REL", "VISUAL": "VIS", "CHANGE": "CHG"}
@@ -472,7 +479,7 @@ def _render_compact(state, cols, rows, put):
     rings = state["rings"]
     ex, ey = rings.extent()
     side, knobs, sel = state["side"], state["knobs"], state["selected"]
-    if _visual(state) == "BEHIND" or state.get("window"):
+    if _scene_elsewhere(state):
         cw = 0                                   # the scene is already behind the pane / the window
     else:
         cw = max(8, min(int(2 * rows * ex / ey), cols * 45 // 100))   # canvas cols matching ring aspect
@@ -535,7 +542,7 @@ def render(state, cols, rows):
     if state.get("radio"):
         for r, text in enumerate(radio_panel(state["radio"], cols - 4, h)):
             put(top + r, 3, text)
-    elif not behind:
+    elif not _scene_elsewhere(state):
         for r, text in enumerate(scene(state, cols - 4, h)):
             put(top + r, 3, text)
 

@@ -1889,5 +1889,26 @@ class PresetTest(unittest.TestCase):
         self.assertEqual(runs[0], runs[1])
 
 
+class WindowLayoutTest(unittest.TestCase):
+    def test_window_on_every_tab_gets_knobs_and_no_second_scene(self):
+        ps = app.make_params()
+        e, m = app.Engine(ps), app.Menu(ps)
+        for window in (True, False):
+            for page in m.pages:
+                m.page = page
+                st = app.ui_state(e, m)
+                st["window"] = window
+                plain = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", ui.render(st, 186, 15))
+                if window:
+                    self.assertTrue(ui.knob_layout_fits(st, 186, 15), page)
+                    self.assertGreaterEqual(plain.count("╭"), len(st["side"] + st["knobs"]), page)
+                    if page != "MODS":                   # MODS' mover bars use block glyphs
+                        self.assertNotRegex(plain, "[▀▄█]", page)
+            m.page = "BALLS"
+            st = app.ui_state(e, m)
+            st["window"] = False
+            self.assertFalse(ui.knob_layout_fits(st, 186, 15))   # scene shown here: needs its rows
+
+
 if __name__ == "__main__":
     unittest.main()
